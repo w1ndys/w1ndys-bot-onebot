@@ -184,7 +184,7 @@ func main() {
 		projectlogger.Error("构建目标插件事件入口失败", "error", err)
 		return
 	}
-	runtimeService, err := plugin.NewRuntimeService(specCatalog, runtimeController, runtimeStateRepository, adminService)
+	runtimeService, err := plugin.NewRuntimeService(specCatalog, runtimeController, runtimeStateRepository, adminService, botAPI)
 	// [决策理由] 开关服务是 WebUI 与 QQ 应急入口的唯一写路径，缺失时目标插件将无法管理。
 	if err != nil {
 		projectlogger.Error("构建插件开关服务失败", "error", err)

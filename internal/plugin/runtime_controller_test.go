@@ -150,6 +150,98 @@ func TestRuntimeControllerGroupGateFailsClosedAndPersistsOffline(t *testing.T) {
 	}
 }
 
+func TestRuntimeControllerBatchGroupStatesPrevalidateBeforeMutation(t *testing.T) {
+	catalog, err := NewSpecCatalog([]PluginSpec{validPluginSpec("echo", "echo"), validPluginSpec("tools", "tools")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.SetGroupStates(100, map[string]bool{"echo": true, "tools": true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.SetGroupStates(100, map[string]bool{"echo": false, "missing": false}); !errors.Is(err, ErrRuntimePluginNotFound) {
+		t.Fatalf("SetGroupStates() error = %v", err)
+	}
+	for _, pluginKey := range []string{"echo", "tools"} {
+		if enabled, found := runtimeControllerGroupState(t, controller, pluginKey, 100); !found || !enabled {
+			t.Fatalf("prevalidation mutated %s = %t,%t", pluginKey, enabled, found)
+		}
+	}
+	if err := controller.SetGroupStates(100, map[string]bool{"tools": false, "echo": false}); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := []RuntimeGroupStateKey{{PluginKey: "echo", GroupID: 100}, {PluginKey: "echo", GroupID: 100}}
+	if err := controller.DeleteGroupStates(duplicate); !errors.Is(err, ErrRuntimeGroupStateDuplicate) {
+		t.Fatalf("DeleteGroupStates() duplicate error = %v", err)
+	}
+	if _, found := runtimeControllerGroupState(t, controller, "echo", 100); !found {
+		t.Fatal("duplicate cleanup partially deleted state")
+	}
+	if err := controller.DeleteGroupStates([]RuntimeGroupStateKey{{PluginKey: "tools", GroupID: 100}, {PluginKey: "echo", GroupID: 100}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pluginKey := range []string{"echo", "tools"} {
+		if _, found := runtimeControllerGroupState(t, controller, pluginKey, 100); found {
+			t.Fatalf("state %s was not deleted", pluginKey)
+		}
+	}
+}
+
+func TestRuntimeControllerBatchGroupStatesConcurrentWithAdmission(t *testing.T) {
+	catalog, err := NewSpecCatalog([]PluginSpec{validPluginSpec("echo", "echo"), validPluginSpec("tools", "tools")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pluginKey := range []string{"echo", "tools"} {
+		if err := controller.Enable(context.Background(), pluginKey); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys := []RuntimeGroupStateKey{{PluginKey: "echo", GroupID: 100}, {PluginKey: "tools", GroupID: 100}}
+	errorsFound := make(chan error, 4)
+	var group sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		group.Add(1)
+		go func(worker int) {
+			defer group.Done()
+			for index := 0; index < 1000; index++ {
+				switch worker {
+				case 0:
+					if err := controller.SetGroupStates(100, map[string]bool{"echo": index%2 == 0, "tools": index%2 != 0}); err != nil {
+						errorsFound <- err
+						return
+					}
+				case 1:
+					if err := controller.DeleteGroupStates(keys); err != nil {
+						errorsFound <- err
+						return
+					}
+				default:
+					for _, pluginKey := range []string{"echo", "tools"} {
+						admission, admitted := controller.Admit(pluginKey)
+						if admitted {
+							_ = admission.GroupEnabled(100)
+							admission.Release()
+						}
+					}
+				}
+			}
+		}(worker)
+	}
+	group.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("concurrent batch operation: %v", err)
+	}
+}
+
 func TestRuntimeControllerDisableStopsAdmissionAndDrains(t *testing.T) {
 	lifecycle := &runtimeTestLifecycle{disableCalled: make(chan struct{})}
 	controller := newRuntimeTestController(t, lifecycle)

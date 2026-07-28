@@ -4,10 +4,102 @@ package onebot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/w1ndys/w1ndys-bot/internal/ws"
 )
+
+func TestGetGroupListPreservesFieldsAndParams(t *testing.T) {
+	data := `[{"group_id":100,"group_name":"测试群","group_remark":"备注","group_all_shut":1,"member_count":20,"max_member_count":200}]`
+	for _, test := range []struct {
+		name    string
+		noCache bool
+		want    string
+	}{
+		{name: "skip cache", noCache: true, want: `{"no_cache":true}`},
+		{name: "use cache", noCache: false, want: `{"no_cache":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caller := &fakeCaller{result: ws.ActionResponse{Status: "ok", Data: json.RawMessage(data)}}
+			result, err := New(caller).GetGroupList(context.Background(), test.noCache)
+			if err != nil {
+				t.Fatalf("GetGroupList() error=%v", err)
+			}
+			if len(result) != 1 || result[0].GroupID != 100 || result[0].GroupName != "测试群" || result[0].GroupRemark != "备注" || result[0].GroupAllShut != 1 || result[0].MemberCount != 20 || result[0].MaxMemberCount != 200 {
+				t.Fatalf("GetGroupList() result=%+v", result)
+			}
+			if caller.action != string(ActionGetGroupList) {
+				t.Fatalf("GetGroupList() action=%q", caller.action)
+			}
+			params, marshalErr := json.Marshal(caller.params)
+			if marshalErr != nil {
+				t.Fatalf("marshal params: %v", marshalErr)
+			}
+			if string(params) != test.want {
+				t.Fatalf("GetGroupList() params=%s want=%s", params, test.want)
+			}
+		})
+	}
+}
+
+func TestGetGroupListRejectsInvalidIDs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data string
+	}{
+		{name: "zero", data: `[{"group_id":0}]`},
+		{name: "negative", data: `[{"group_id":-1}]`},
+		{name: "duplicate", data: `[{"group_id":100},{"group_id":100}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caller := &fakeCaller{result: ws.ActionResponse{Status: "ok", Data: json.RawMessage(test.data)}}
+			result, err := New(caller).GetGroupList(context.Background(), false)
+			if err == nil || result != nil {
+				t.Fatalf("GetGroupList() result=%+v error=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestGetGroupListDistinguishesEmptyArrayFromNull(t *testing.T) {
+	empty, err := New(&fakeCaller{result: ws.ActionResponse{Status: "ok", Data: json.RawMessage(`[]`)}}).GetGroupList(context.Background(), true)
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("empty array result=%#v error=%v", empty, err)
+	}
+	nullResult, err := New(&fakeCaller{result: ws.ActionResponse{Status: "ok", Data: json.RawMessage(`null`)}}).GetGroupList(context.Background(), true)
+	if err == nil || nullResult != nil {
+		t.Fatalf("null result=%#v error=%v", nullResult, err)
+	}
+}
+
+func TestGetGroupListDiscardsResultsOnCallErrors(t *testing.T) {
+	wantErr := errors.New("connection closed")
+	for _, test := range []struct {
+		name   string
+		caller *fakeCaller
+	}{
+		{
+			name:   "caller error",
+			caller: &fakeCaller{err: wantErr},
+		},
+		{
+			name:   "action error",
+			caller: &fakeCaller{result: ws.ActionResponse{Status: "failed", RetCode: 1400, Message: "bad request"}},
+		},
+		{
+			name:   "decode error",
+			caller: &fakeCaller{result: ws.ActionResponse{Status: "ok", Data: json.RawMessage(`[{"group_id":100},{"group_id":"bad"}]`)}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := New(test.caller).GetGroupList(context.Background(), false)
+			if err == nil || result != nil {
+				t.Fatalf("GetGroupList() result=%+v error=%v", result, err)
+			}
+		})
+	}
+}
 
 // TestSetGroupBanValidatesAndCallsOfficialAction 验证禁言参数校验与官方 Action 请求形状。
 // @param t：Go 测试上下文。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/w1ndys/w1ndys-bot/internal/management"
+	"github.com/w1ndys/w1ndys-bot/internal/onebot"
 )
 
 var runtimeServiceActor = management.Actor{ID: "10001", Role: "super_admin", Channel: management.ChannelWebUI, RequestID: "req-1"}
@@ -26,6 +28,11 @@ type runtimeServiceStore struct {
 	findErr       error
 	updateErr     error
 	groupErr      error
+	copyErr       error
+	cleanupErr    error
+	copyResult    []RuntimeGroupStateRecord
+	beforeCopy    func()
+	beforeCleanup func()
 	findConfigErr error
 	saveConfigErr error
 }
@@ -137,6 +144,93 @@ func (s *runtimeServiceStore) SetGroupEnabled(_ context.Context, actor managemen
 	return saved, nil
 }
 
+func (s *runtimeServiceStore) CopyGroupStates(_ context.Context, actor management.Actor, sourceGroupID, targetGroupID int64, allowedPluginKeys []string, items []RuntimeGroupCopyItem) ([]RuntimeGroupStateRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, "persist-copy")
+	s.actors = append(s.actors, actor)
+	if s.beforeCopy != nil {
+		s.beforeCopy()
+	}
+	if s.copyErr != nil {
+		return nil, s.copyErr
+	}
+	requested := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		requested[item.PluginKey] = struct{}{}
+	}
+	for _, pluginKey := range allowedPluginKeys {
+		if source, found := findPersistedGroup(s.states[pluginKey].Groups, sourceGroupID); found {
+			if _, included := requested[pluginKey]; !included || source.Version <= 0 {
+				return nil, ErrRuntimeStateConflict
+			}
+		}
+	}
+	now := time.Now().UTC()
+	saved := make([]RuntimeGroupStateRecord, 0, len(items))
+	for _, item := range items {
+		state, found := s.states[item.PluginKey]
+		if !found {
+			return nil, ErrRuntimeStateConflict
+		}
+		source, sourceFound := findPersistedGroup(state.Groups, sourceGroupID)
+		target, targetFound := findPersistedGroup(state.Groups, targetGroupID)
+		if !sourceFound || source.Enabled != item.Enabled || source.Version != item.SourceVersion || targetFound && target.Version != item.TargetVersion || !targetFound && item.TargetVersion != 0 {
+			return nil, ErrRuntimeStateConflict
+		}
+		if targetFound && target.Enabled == item.Enabled {
+			saved = append(saved, RuntimeGroupStateRecord{PluginKey: item.PluginKey, GroupID: targetGroupID, Enabled: target.Enabled, Version: target.Version, UpdatedAt: target.UpdatedAt})
+			continue
+		}
+		version := int64(1)
+		if targetFound {
+			version = target.Version + 1
+		}
+		target = PersistedGroupState{GroupID: targetGroupID, Enabled: item.Enabled, Version: version, UpdatedAt: now}
+		state.Groups = mergePersistedGroup(state.Groups, target)
+		s.states[item.PluginKey] = state
+		saved = append(saved, RuntimeGroupStateRecord{PluginKey: item.PluginKey, GroupID: targetGroupID, Enabled: item.Enabled, Version: version, UpdatedAt: now})
+	}
+	if s.copyResult != nil {
+		return append([]RuntimeGroupStateRecord(nil), s.copyResult...), nil
+	}
+	return saved, nil
+}
+
+func (s *runtimeServiceStore) CleanupGroupStates(_ context.Context, actor management.Actor, expected []RuntimeGroupStateRecord) ([]RuntimeGroupStateRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, "persist-cleanup")
+	s.actors = append(s.actors, actor)
+	if s.beforeCleanup != nil {
+		s.beforeCleanup()
+	}
+	if s.cleanupErr != nil {
+		return nil, s.cleanupErr
+	}
+	deleted := make([]RuntimeGroupStateRecord, 0, len(expected))
+	for _, item := range expected {
+		state, found := s.states[item.PluginKey]
+		if !found {
+			return nil, ErrRuntimeStateConflict
+		}
+		group, groupFound := findPersistedGroup(state.Groups, item.GroupID)
+		if !groupFound || group.Version != item.Version {
+			return nil, ErrRuntimeStateConflict
+		}
+		deleted = append(deleted, RuntimeGroupStateRecord{PluginKey: item.PluginKey, GroupID: item.GroupID, Enabled: group.Enabled, Version: group.Version, UpdatedAt: group.UpdatedAt})
+		next := make([]PersistedGroupState, 0, len(state.Groups)-1)
+		for _, current := range state.Groups {
+			if current.GroupID != item.GroupID {
+				next = append(next, current)
+			}
+		}
+		state.Groups = next
+		s.states[item.PluginKey] = state
+	}
+	return deleted, nil
+}
+
 func (s *runtimeServiceStore) log() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,6 +266,36 @@ func (a *runtimeServiceAuthorizer) Authorize(management.Actor) error {
 	return a.err
 }
 
+type runtimeServiceGroupDirectory struct {
+	mu       sync.Mutex
+	groups   []onebot.GroupInfo
+	err      error
+	noCache  []bool
+	onLookup func()
+}
+
+func (d *runtimeServiceGroupDirectory) GetGroupList(_ context.Context, noCache bool) ([]onebot.GroupInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.onLookup != nil {
+		d.onLookup()
+	}
+	d.noCache = append(d.noCache, noCache)
+	return append([]onebot.GroupInfo(nil), d.groups...), d.err
+}
+
+func (d *runtimeServiceGroupDirectory) setGroups(groups ...onebot.GroupInfo) {
+	d.mu.Lock()
+	d.groups = append([]onebot.GroupInfo(nil), groups...)
+	d.mu.Unlock()
+}
+
+func (d *runtimeServiceGroupDirectory) lookups() []bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]bool(nil), d.noCache...)
+}
+
 func newRuntimeServiceSubject(t *testing.T, store *runtimeServiceStore, authorizer *runtimeServiceAuthorizer, specs ...PluginSpec) (*RuntimeService, *RuntimeController) {
 	t.Helper()
 	catalog, err := NewSpecCatalog(specs)
@@ -182,11 +306,388 @@ func newRuntimeServiceSubject(t *testing.T, store *runtimeServiceStore, authoriz
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewRuntimeService(catalog, controller, store, authorizer)
+	service, err := NewRuntimeService(catalog, controller, store, authorizer, &runtimeServiceGroupDirectory{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service, controller
+}
+
+func newRuntimeGroupMaintenanceSubject(t *testing.T, store *runtimeServiceStore, groups *runtimeServiceGroupDirectory, specs ...PluginSpec) (*RuntimeService, *RuntimeController) {
+	t.Helper()
+	catalog, err := NewSpecCatalog(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewRuntimeService(catalog, controller, store, &runtimeServiceAuthorizer{}, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, controller
+}
+
+func runtimeControllerGroupState(t *testing.T, controller *RuntimeController, pluginKey string, groupID int64) (bool, bool) {
+	t.Helper()
+	entry, found := controller.entry(pluginKey)
+	if !found {
+		t.Fatalf("controller plugin %s not found", pluginKey)
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	enabled, found := entry.groups[groupID]
+	return enabled, found
+}
+
+func TestRuntimeServicePreviewsGroupCopyWithTargetDifference(t *testing.T) {
+	zone := time.FixedZone("preview", 8*60*60)
+	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, zone)
+	store := newRuntimeServiceStore(
+		PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{
+			{GroupID: 100, Enabled: true, Version: 2, UpdatedAt: updatedAt},
+			{GroupID: 200, Enabled: false, Version: 4, UpdatedAt: updatedAt},
+		}},
+		PersistedPluginState{PluginKey: "tools", Groups: []PersistedGroupState{{GroupID: 100, Enabled: false, Version: 3, UpdatedAt: updatedAt}}},
+		PersistedPluginState{PluginKey: "legacy", Groups: []PersistedGroupState{{GroupID: 100, Enabled: true, Version: 9, UpdatedAt: updatedAt}}},
+	)
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{
+		{GroupID: 200, GroupName: "target"},
+		{GroupID: 100, GroupName: "source"},
+	}}
+	service, _ := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("tools", "tools"), validPluginSpec("echo", "echo"))
+
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Source.GroupName != "source" || preview.Target.GroupName != "target" || len(preview.States) != 2 {
+		t.Fatalf("preview = %+v", preview)
+	}
+	if preview.States[0].PluginKey != "echo" || !preview.States[0].Enabled || preview.States[0].SourceVersion != 2 || preview.States[0].TargetVersion != 4 || preview.States[0].TargetEnabled == nil || *preview.States[0].TargetEnabled {
+		t.Fatalf("echo preview = %+v", preview.States[0])
+	}
+	if preview.States[1].PluginKey != "tools" || preview.States[1].TargetVersion != 0 || preview.States[1].TargetEnabled != nil {
+		t.Fatalf("tools preview = %+v", preview.States[1])
+	}
+	if !reflect.DeepEqual(directory.lookups(), []bool{true}) {
+		t.Fatalf("GetGroupList noCache = %v", directory.lookups())
+	}
+}
+
+func TestRuntimeServiceCopiesGroupStatesWithMergeAndFailClosedOrdering(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(
+		PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{{GroupID: 100, Enabled: true, Version: 2, UpdatedAt: now}, {GroupID: 200, Enabled: false, Version: 4, UpdatedAt: now}}},
+		PersistedPluginState{PluginKey: "tools", Groups: []PersistedGroupState{{GroupID: 100, Enabled: false, Version: 3, UpdatedAt: now}, {GroupID: 200, Enabled: true, Version: 5, UpdatedAt: now}}},
+		PersistedPluginState{PluginKey: "extra", Groups: []PersistedGroupState{{GroupID: 200, Enabled: true, Version: 7, UpdatedAt: now}}},
+	)
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory,
+		validPluginSpec("tools", "tools"), validPluginSpec("extra", "extra"), validPluginSpec("echo", "echo"))
+	for pluginKey, enabled := range map[string]bool{"echo": false, "tools": true, "extra": true} {
+		if err := controller.SetGroupEnabled(pluginKey, 200, enabled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.beforeCopy = func() {
+		if enabled, _ := runtimeControllerGroupState(t, controller, "echo", 200); enabled {
+			t.Error("true target opened before transaction committed")
+		}
+		if enabled, _ := runtimeControllerGroupState(t, controller, "tools", 200); enabled {
+			t.Error("false target was not pre-closed")
+		}
+		if enabled, _ := runtimeControllerGroupState(t, controller, "extra", 200); !enabled {
+			t.Error("target-only state changed during merge copy")
+		}
+	}
+
+	result, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SourceGroupID != 100 || result.TargetGroupID != 200 || len(result.States) != 2 {
+		t.Fatalf("result = %+v", result)
+	}
+	for pluginKey, want := range map[string]bool{"echo": true, "tools": false, "extra": true} {
+		if got, found := runtimeControllerGroupState(t, controller, pluginKey, 200); !found || got != want {
+			t.Fatalf("controller %s target = %t,%t want %t", pluginKey, got, found, want)
+		}
+	}
+	if !reflect.DeepEqual(store.log(), []string{"persist-copy"}) {
+		t.Fatalf("store log = %v", store.log())
+	}
+	if !reflect.DeepEqual(directory.lookups(), []bool{true, true}) {
+		t.Fatalf("GetGroupList noCache = %v", directory.lookups())
+	}
+}
+
+func TestRuntimeServiceCopyFailureRestoresTargetSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	failure := errors.New("copy failed")
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{
+		{GroupID: 100, Enabled: false, Version: 2, UpdatedAt: now},
+		{GroupID: 200, Enabled: true, Version: 4, UpdatedAt: now},
+	}})
+	store.copyErr = failure
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if err := controller.SetGroupEnabled("echo", 200, true); err != nil {
+		t.Fatal(err)
+	}
+	store.beforeCopy = func() {
+		if enabled, _ := runtimeControllerGroupState(t, controller, "echo", 200); enabled {
+			t.Error("false target was not pre-closed before persistence")
+		}
+	}
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States); !errors.Is(err, failure) {
+		t.Fatalf("CopyGroupStates() error = %v", err)
+	}
+	if enabled, found := runtimeControllerGroupState(t, controller, "echo", 200); !found || !enabled {
+		t.Fatalf("restored copy target = %t,%t", enabled, found)
+	}
+}
+
+func TestRuntimeServiceCopyFailureRestoresAbsentTargetSnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{
+		{GroupID: 100, Enabled: false, Version: 2, UpdatedAt: now},
+	}})
+	store.copyErr = errors.New("copy rolled back")
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States); !errors.Is(err, store.copyErr) {
+		t.Fatalf("CopyGroupStates() error = %v", err)
+	}
+	if enabled, found := runtimeControllerGroupState(t, controller, "echo", 200); found || enabled {
+		t.Fatalf("restored absent target = %t,%t", enabled, found)
+	}
+}
+
+func TestRuntimeServiceCopyUnknownCommitKeepsWholeBatchClosed(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{
+		{GroupID: 100, Enabled: false, Version: 2, UpdatedAt: now},
+		{GroupID: 200, Enabled: true, Version: 4, UpdatedAt: now},
+	}})
+	store.copyErr = errors.Join(ErrRuntimeStateCommitUnknown, errors.New("connection lost"))
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if err := controller.SetGroupEnabled("echo", 200, true); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States); !errors.Is(err, ErrRuntimeStateCommitUnknown) {
+		t.Fatalf("unknown commit error = %v", err)
+	}
+	if enabled, found := runtimeControllerGroupState(t, controller, "echo", 200); !found || enabled {
+		t.Fatalf("unknown commit target = %t,%t", enabled, found)
+	}
+}
+
+func TestRuntimeServiceCopyInvalidCommittedResultClosesWholeBatch(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{
+		{GroupID: 100, Enabled: true, Version: 2, UpdatedAt: now},
+		{GroupID: 200, Enabled: false, Version: 4, UpdatedAt: now},
+	}})
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if err := controller.SetGroupEnabled("echo", 200, false); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.copyResult = []RuntimeGroupStateRecord{{PluginKey: "echo", GroupID: 999, Enabled: true, Version: 5, UpdatedAt: now}}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States); err == nil {
+		t.Fatal("invalid committed result was accepted")
+	}
+	if enabled, found := runtimeControllerGroupState(t, controller, "echo", 200); !found || enabled {
+		t.Fatalf("invalid committed result target = %t,%t", enabled, found)
+	}
+}
+
+func TestRuntimeServiceCopyRejectsIncompletePreviewAndRechecksLiveGroups(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(
+		PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{{GroupID: 100, Enabled: true, Version: 2, UpdatedAt: now}}},
+		PersistedPluginState{PluginKey: "tools", Groups: []PersistedGroupState{{GroupID: 100, Enabled: false, Version: 3, UpdatedAt: now}}},
+	)
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, _ := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"), validPluginSpec("tools", "tools"))
+	preview, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States[:1]); !errors.Is(err, ErrRuntimeStateConflict) {
+		t.Fatalf("incomplete copy error = %v", err)
+	}
+	if len(store.log()) != 0 {
+		t.Fatalf("incomplete copy persisted: %v", store.log())
+	}
+	directory.setGroups(onebot.GroupInfo{GroupID: 100})
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, preview.States); !errors.Is(err, ErrRuntimeGroupNotLive) {
+		t.Fatalf("departed target error = %v", err)
+	}
+	if len(store.log()) != 0 {
+		t.Fatalf("departed target persisted: %v", store.log())
+	}
+}
+
+func TestRuntimeServicePreviewsAndCleansStaleGroupStates(t *testing.T) {
+	zone := time.FixedZone("stale", -5*60*60)
+	updatedAt := time.Date(2026, 7, 28, 3, 0, 0, 0, zone)
+	store := newRuntimeServiceStore(
+		PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{{GroupID: 100, Enabled: true, Version: 1, UpdatedAt: updatedAt}, {GroupID: 200, Enabled: true, Version: 2, UpdatedAt: updatedAt}}},
+		PersistedPluginState{PluginKey: "tools", Groups: []PersistedGroupState{{GroupID: 300, Enabled: false, Version: 3, UpdatedAt: updatedAt}}},
+		PersistedPluginState{PluginKey: "legacy", Groups: []PersistedGroupState{{GroupID: 400, Enabled: true, Version: 4, UpdatedAt: updatedAt}}},
+	)
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}}}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("tools", "tools"), validPluginSpec("echo", "echo"))
+	for _, state := range []RuntimeGroupStateRecord{{PluginKey: "echo", GroupID: 200, Enabled: true}, {PluginKey: "tools", GroupID: 300, Enabled: true}} {
+		if err := controller.SetGroupEnabled(state.PluginKey, state.GroupID, state.Enabled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preview, err := service.PreviewStaleGroupStates(context.Background(), runtimeServiceActor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview) != 3 || preview[0].PluginKey != "echo" || preview[0].GroupID != 200 || preview[1].PluginKey != "legacy" || preview[1].GroupID != 400 || preview[2].PluginKey != "tools" || preview[2].GroupID != 300 {
+		t.Fatalf("stale preview = %+v", preview)
+	}
+	if preview[0].UpdatedAt.Location() != time.UTC || preview[1].UpdatedAt.Location() != time.UTC {
+		t.Fatalf("stale preview timestamps = %+v", preview)
+	}
+	store.beforeCleanup = func() {
+		for _, state := range preview {
+			if state.PluginKey == "legacy" {
+				continue
+			}
+			if enabled, _ := runtimeControllerGroupState(t, controller, state.PluginKey, state.GroupID); enabled {
+				t.Errorf("%s:%d was not pre-closed", state.PluginKey, state.GroupID)
+			}
+		}
+	}
+	request := append([]RuntimeStaleGroupState(nil), preview...)
+	request[0].Enabled = false
+	request[0].UpdatedAt = time.Time{}
+	deleted, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 3 || !deleted[0].Enabled || deleted[0].UpdatedAt.Location() != time.UTC || deleted[1].PluginKey != "legacy" {
+		t.Fatalf("deleted authority = %+v", deleted)
+	}
+	for _, state := range deleted {
+		if state.PluginKey == "legacy" {
+			continue
+		}
+		if enabled, found := runtimeControllerGroupState(t, controller, state.PluginKey, state.GroupID); found || enabled {
+			t.Fatalf("deleted controller state %s:%d = %t,%t", state.PluginKey, state.GroupID, enabled, found)
+		}
+	}
+	if !reflect.DeepEqual(directory.lookups(), []bool{true, true}) {
+		t.Fatalf("GetGroupList noCache = %v", directory.lookups())
+	}
+}
+
+func TestRuntimeServiceCleanupRechecksLiveAndFailureStaysClosed(t *testing.T) {
+	now := time.Now().UTC()
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo", Groups: []PersistedGroupState{{GroupID: 200, Enabled: true, Version: 2, UpdatedAt: now}}})
+	directory := &runtimeServiceGroupDirectory{}
+	service, controller := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if err := controller.SetGroupEnabled("echo", 200, true); err != nil {
+		t.Fatal(err)
+	}
+	request := []RuntimeStaleGroupState{{PluginKey: "echo", GroupID: 200, Version: 2}}
+	directory.setGroups(onebot.GroupInfo{GroupID: 200})
+	if _, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, request); !errors.Is(err, ErrRuntimeGroupStateNotStale) {
+		t.Fatalf("live cleanup error = %v", err)
+	}
+	if enabled, _ := runtimeControllerGroupState(t, controller, "echo", 200); !enabled {
+		t.Fatal("live validation changed controller")
+	}
+	store.cleanupErr = errors.New("cleanup failed")
+	directory.setGroups()
+	if _, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, request); !errors.Is(err, store.cleanupErr) {
+		t.Fatalf("failed cleanup error = %v", err)
+	}
+	if enabled, found := runtimeControllerGroupState(t, controller, "echo", 200); !found || enabled {
+		t.Fatalf("failed cleanup controller = %t,%t", enabled, found)
+	}
+}
+
+func TestRuntimeServiceGroupMaintenanceStableValidationErrors(t *testing.T) {
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo"})
+	directory := &runtimeServiceGroupDirectory{groups: []onebot.GroupInfo{{GroupID: 100}, {GroupID: 200}}}
+	service, _ := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if _, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200); !errors.Is(err, ErrRuntimeGroupSourceStateNotFound) {
+		t.Fatalf("missing source state error = %v", err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 100, []RuntimeGroupCopyItem{{PluginKey: "echo", SourceVersion: 1}}); !errors.Is(err, ErrRuntimeGroupCopySameGroup) {
+		t.Fatalf("same group error = %v", err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, nil); !errors.Is(err, ErrRuntimeGroupBatchEmpty) {
+		t.Fatalf("empty copy error = %v", err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, []RuntimeGroupCopyItem{{PluginKey: "missing", SourceVersion: 1}}); !errors.Is(err, ErrRuntimePluginNotFound) {
+		t.Fatalf("unknown copy plugin error = %v", err)
+	}
+	tooManyCopies := make([]RuntimeGroupCopyItem, RuntimeGroupBatchLimit+1)
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, tooManyCopies); !errors.Is(err, ErrRuntimeGroupBatchTooLarge) {
+		t.Fatalf("large copy error = %v", err)
+	}
+	cleanupTests := []struct {
+		name   string
+		states []RuntimeStaleGroupState
+		want   error
+	}{
+		{name: "empty", want: ErrRuntimeGroupBatchEmpty},
+		{name: "duplicate", states: []RuntimeStaleGroupState{{PluginKey: "echo", GroupID: 300, Version: 1}, {PluginKey: "echo", GroupID: 300, Version: 1}}, want: ErrRuntimeGroupStateDuplicate},
+		{name: "unknown", states: []RuntimeStaleGroupState{{PluginKey: "missing", GroupID: 300, Version: 1}}, want: ErrRuntimeStateConflict},
+		{name: "invalid version", states: []RuntimeStaleGroupState{{PluginKey: "echo", GroupID: 300}}, want: ErrRuntimeStateInvalidVersion},
+		{name: "invalid group", states: []RuntimeStaleGroupState{{PluginKey: "echo", Version: 1}}, want: ErrInvalidRuntimeGroupID},
+	}
+	for _, test := range cleanupTests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, test.states); !errors.Is(err, test.want) {
+				t.Fatalf("CleanupStaleGroupStates() error = %v", err)
+			}
+		})
+	}
+	tooMany := make([]RuntimeStaleGroupState, RuntimeGroupBatchLimit+1)
+	if _, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, tooMany); !errors.Is(err, ErrRuntimeGroupBatchTooLarge) {
+		t.Fatalf("large cleanup error = %v", err)
+	}
+}
+
+func TestRuntimeServiceGroupDirectoryErrorsAreStable(t *testing.T) {
+	store := newRuntimeServiceStore(PersistedPluginState{PluginKey: "echo"})
+	directory := &runtimeServiceGroupDirectory{err: errors.New("onebot unavailable")}
+	service, _ := newRuntimeGroupMaintenanceSubject(t, store, directory, validPluginSpec("echo", "echo"))
+	if _, err := service.PreviewStaleGroupStates(context.Background(), runtimeServiceActor); !errors.Is(err, ErrRuntimeGroupDirectoryUnavailable) {
+		t.Fatalf("directory failure error = %v", err)
+	}
 }
 
 func TestNewRuntimeServiceRejectsMissingDependencies(t *testing.T) {
@@ -199,22 +700,26 @@ func TestNewRuntimeServiceRejectsMissingDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 	var typedNilStore *runtimeServiceStore
+	var typedNilGroups *runtimeServiceGroupDirectory
 	tests := []struct {
 		name       string
 		catalog    *SpecCatalog
 		controller *RuntimeController
 		store      RuntimeStateStore
 		authorizer RuntimeAuthorizer
+		groups     RuntimeGroupDirectory
 	}{
-		{name: "catalog", controller: controller, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}},
-		{name: "controller", catalog: catalog, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}},
-		{name: "store", catalog: catalog, controller: controller, authorizer: &runtimeServiceAuthorizer{}},
-		{name: "typed nil store", catalog: catalog, controller: controller, store: typedNilStore, authorizer: &runtimeServiceAuthorizer{}},
-		{name: "authorizer", catalog: catalog, controller: controller, store: newRuntimeServiceStore()},
+		{name: "catalog", controller: controller, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}, groups: &runtimeServiceGroupDirectory{}},
+		{name: "controller", catalog: catalog, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}, groups: &runtimeServiceGroupDirectory{}},
+		{name: "store", catalog: catalog, controller: controller, authorizer: &runtimeServiceAuthorizer{}, groups: &runtimeServiceGroupDirectory{}},
+		{name: "typed nil store", catalog: catalog, controller: controller, store: typedNilStore, authorizer: &runtimeServiceAuthorizer{}, groups: &runtimeServiceGroupDirectory{}},
+		{name: "authorizer", catalog: catalog, controller: controller, store: newRuntimeServiceStore(), groups: &runtimeServiceGroupDirectory{}},
+		{name: "groups", catalog: catalog, controller: controller, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}},
+		{name: "typed nil groups", catalog: catalog, controller: controller, store: newRuntimeServiceStore(), authorizer: &runtimeServiceAuthorizer{}, groups: typedNilGroups},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			service, err := NewRuntimeService(test.catalog, test.controller, test.store, test.authorizer)
+			service, err := NewRuntimeService(test.catalog, test.controller, test.store, test.authorizer, test.groups)
 			if service != nil || err == nil {
 				t.Fatalf("NewRuntimeService() = %v,%v", service, err)
 			}
@@ -239,6 +744,18 @@ func TestRuntimeServiceReadsRequireAuthorization(t *testing.T) {
 	}
 	if _, err := service.SetGroupEnabled(context.Background(), runtimeServiceActor, "echo", 100, true, 0); !errors.Is(err, forbidden) {
 		t.Fatalf("SetGroupEnabled() error = %v", err)
+	}
+	if _, err := service.PreviewGroupCopy(context.Background(), runtimeServiceActor, 100, 200); !errors.Is(err, forbidden) {
+		t.Fatalf("PreviewGroupCopy() error = %v", err)
+	}
+	if _, err := service.CopyGroupStates(context.Background(), runtimeServiceActor, 100, 200, []RuntimeGroupCopyItem{{PluginKey: "echo", SourceVersion: 1}}); !errors.Is(err, forbidden) {
+		t.Fatalf("CopyGroupStates() error = %v", err)
+	}
+	if _, err := service.PreviewStaleGroupStates(context.Background(), runtimeServiceActor); !errors.Is(err, forbidden) {
+		t.Fatalf("PreviewStaleGroupStates() error = %v", err)
+	}
+	if _, err := service.CleanupStaleGroupStates(context.Background(), runtimeServiceActor, []RuntimeStaleGroupState{{PluginKey: "echo", GroupID: 100, Version: 1}}); !errors.Is(err, forbidden) {
+		t.Fatalf("CleanupStaleGroupStates() error = %v", err)
 	}
 	if len(store.log()) != 0 {
 		t.Fatalf("unauthorized calls touched store: %v", store.log())

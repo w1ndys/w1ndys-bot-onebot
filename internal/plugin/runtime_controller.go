@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -41,6 +42,11 @@ type runtimeEntry struct {
 	inFlight  int
 	idle      chan struct{}
 	lastError error
+}
+
+type runtimeGroupMemoryState struct {
+	Enabled bool
+	Exists  bool
 }
 
 // RuntimeController 管理目标插件的纯内存生命周期、群门禁和在途调用。
@@ -87,6 +93,143 @@ func (c *RuntimeController) SetGroupEnabled(pluginKey string, groupID int64, ena
 	entry.mu.Lock()
 	entry.groups[groupID] = enabled
 	entry.mu.Unlock()
+	return nil
+}
+
+// SetGroupStates 在预校验后按固定锁顺序原子发布一个群的多个插件门禁。
+func (c *RuntimeController) SetGroupStates(groupID int64, states map[string]bool) error {
+	if groupID <= 0 {
+		return ErrInvalidRuntimeGroupID
+	}
+	keys := make([]string, 0, len(states))
+	entries := make([]*runtimeEntry, 0, len(states))
+	for pluginKey := range states {
+		if _, found := c.entry(pluginKey); !found {
+			return fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, pluginKey)
+		}
+		keys = append(keys, pluginKey)
+	}
+	sort.Strings(keys)
+	for _, pluginKey := range keys {
+		entry, _ := c.entry(pluginKey)
+		entry.mu.Lock()
+		entries = append(entries, entry)
+	}
+	for index, pluginKey := range keys {
+		entries[index].groups[groupID] = states[pluginKey]
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		entries[index].mu.Unlock()
+	}
+	return nil
+}
+
+// DeleteGroupStates 在预校验后按固定锁顺序删除多个显式群门禁；缺失记录保持幂等。
+func (c *RuntimeController) DeleteGroupStates(states []RuntimeGroupStateKey) error {
+	keys := make([]RuntimeGroupStateKey, len(states))
+	copy(keys, states)
+	seen := make(map[RuntimeGroupStateKey]struct{}, len(keys))
+	for _, state := range keys {
+		if state.GroupID <= 0 {
+			return ErrInvalidRuntimeGroupID
+		}
+		if _, found := c.entry(state.PluginKey); !found {
+			return fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, state.PluginKey)
+		}
+		if _, duplicate := seen[state]; duplicate {
+			return ErrRuntimeGroupStateDuplicate
+		}
+		seen[state] = struct{}{}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].PluginKey == keys[j].PluginKey {
+			return keys[i].GroupID < keys[j].GroupID
+		}
+		return keys[i].PluginKey < keys[j].PluginKey
+	})
+	locked := make([]*runtimeEntry, 0, len(keys))
+	lastPluginKey := ""
+	for _, state := range keys {
+		if state.PluginKey == lastPluginKey {
+			continue
+		}
+		entry, _ := c.entry(state.PluginKey)
+		entry.mu.Lock()
+		locked = append(locked, entry)
+		lastPluginKey = state.PluginKey
+	}
+	for _, state := range keys {
+		entry, _ := c.entry(state.PluginKey)
+		delete(entry.groups, state.GroupID)
+	}
+	for index := len(locked) - 1; index >= 0; index-- {
+		locked[index].mu.Unlock()
+	}
+	return nil
+}
+
+func (c *RuntimeController) snapshotGroupStates(groupID int64, pluginKeys []string) (map[string]runtimeGroupMemoryState, error) {
+	if groupID <= 0 {
+		return nil, ErrInvalidRuntimeGroupID
+	}
+	keys := append([]string(nil), pluginKeys...)
+	sort.Strings(keys)
+	entries := make([]*runtimeEntry, 0, len(keys))
+	previous := ""
+	for _, pluginKey := range keys {
+		if pluginKey == previous {
+			return nil, ErrRuntimeGroupStateDuplicate
+		}
+		entry, found := c.entry(pluginKey)
+		if !found {
+			return nil, fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, pluginKey)
+		}
+		entries = append(entries, entry)
+		previous = pluginKey
+	}
+	for _, entry := range entries {
+		entry.mu.Lock()
+	}
+	states := make(map[string]runtimeGroupMemoryState, len(keys))
+	for index, pluginKey := range keys {
+		enabled, found := entries[index].groups[groupID]
+		states[pluginKey] = runtimeGroupMemoryState{Enabled: enabled, Exists: found}
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		entries[index].mu.Unlock()
+	}
+	return states, nil
+}
+
+func (c *RuntimeController) restoreGroupStates(groupID int64, states map[string]runtimeGroupMemoryState) error {
+	if groupID <= 0 {
+		return ErrInvalidRuntimeGroupID
+	}
+	keys := make([]string, 0, len(states))
+	entries := make([]*runtimeEntry, 0, len(states))
+	for pluginKey := range states {
+		if _, found := c.entry(pluginKey); !found {
+			return fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, pluginKey)
+		}
+		keys = append(keys, pluginKey)
+	}
+	sort.Strings(keys)
+	for _, pluginKey := range keys {
+		entry, _ := c.entry(pluginKey)
+		entry.mu.Lock()
+		entries = append(entries, entry)
+	}
+	for index, pluginKey := range keys {
+		state := states[pluginKey]
+		if state.Exists {
+			entries[index].groups[groupID] = state.Enabled
+		} else {
+			delete(entries[index].groups, groupID)
+		}
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		entries[index].mu.Unlock()
+	}
 	return nil
 }
 

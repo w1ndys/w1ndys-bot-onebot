@@ -6,6 +6,34 @@ import (
 	"fmt"
 )
 
+type getGroupListParams struct {
+	NoCache bool `json:"no_cache"`
+}
+
+// GetGroupList 获取机器人加入的群列表。
+func (a *API) GetGroupList(ctx context.Context, noCache bool) ([]GroupInfo, error) {
+	var result []GroupInfo
+	if err := a.Call(ctx, ActionGetGroupList, getGroupListParams{NoCache: noCache}, &result); err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, fmt.Errorf("群列表响应不能为 null")
+	}
+
+	seen := make(map[int64]struct{}, len(result))
+	for i, group := range result {
+		if group.GroupID <= 0 {
+			return nil, fmt.Errorf("群列表第 %d 项的群号无效: %d", i, group.GroupID)
+		}
+		if _, exists := seen[group.GroupID]; exists {
+			return nil, fmt.Errorf("群列表包含重复群号: %d", group.GroupID)
+		}
+		seen[group.GroupID] = struct{}{}
+	}
+
+	return result, nil
+}
+
 // SetGroupBan 设置或解除指定群成员的禁言。
 // @param ctx：请求上下文；params：群号、用户 QQ 及秒数或字符串形式的禁言时长。
 // @returns 参数、Action 业务或传输错误。

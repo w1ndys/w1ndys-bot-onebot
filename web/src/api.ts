@@ -247,6 +247,43 @@ export interface PluginRuntimeState {
   groups: PluginRuntimeGroup[]
 }
 
+export interface RuntimeGroupInfo {
+  group_id: number
+  group_name: string
+  group_remark: string
+  group_all_shut: number
+  member_count: number
+  max_member_count: number
+}
+
+export interface RuntimeGroupCopyItem {
+  plugin_key: string
+  enabled: boolean
+  source_version: number
+  target_version: number
+  target_enabled?: boolean | null
+}
+
+export interface RuntimeGroupCopyPreview {
+  source: RuntimeGroupInfo
+  target: RuntimeGroupInfo
+  states: RuntimeGroupCopyItem[]
+}
+
+export interface RuntimeGroupStateRecord {
+  plugin_key: string
+  group_id: number
+  enabled: boolean
+  version: number
+  updated_at: string
+}
+
+export interface RuntimeGroupCopyResult {
+  source_group_id: number
+  target_group_id: number
+  states: RuntimeGroupStateRecord[]
+}
+
 // listPluginRuntimes 读取目标架构插件的意图、实际运行状态与群开关。
 // @param 无。
 // @returns 按编译期目录顺序排列的插件运行状态。
@@ -290,6 +327,46 @@ export function setPluginRuntimeGroupEnabled(pluginKey: string, groupID: number,
   // 1. echo+100+true+v0 -> PUT -> 新增群记录v1。
   // 2. 全局关闭时写入 -> 200，但命令仍被全局门禁拒绝。
   return result
+}
+
+// previewPluginRuntimeGroupCopy 使用 NapCat 当前群列表预览源群到目标群的显式开关复制。
+export function previewPluginRuntimeGroupCopy(sourceGroupID: number, targetGroupID: number): Promise<RuntimeGroupCopyPreview> {
+  return apiRequest<RuntimeGroupCopyPreview>('/api/plugin-runtimes/group-maintenance/copy/preview', {
+    method: 'POST',
+    body: JSON.stringify({ source_group_id: sourceGroupID, target_group_id: targetGroupID }),
+  })
+}
+
+// copyPluginRuntimeGroupStates 按预览快照中的版本原子复制源群显式开关。
+export function copyPluginRuntimeGroupStates(preview: RuntimeGroupCopyPreview): Promise<RuntimeGroupCopyResult> {
+  return apiRequest<RuntimeGroupCopyResult>('/api/plugin-runtimes/group-maintenance/copy', {
+    method: 'POST',
+    body: JSON.stringify({
+      source_group_id: preview.source.group_id,
+      target_group_id: preview.target.group_id,
+      states: preview.states.map((item) => ({
+        plugin_key: item.plugin_key,
+        enabled: item.enabled,
+        source_version: item.source_version,
+        target_version: item.target_version,
+      })),
+    }),
+  })
+}
+
+// previewStalePluginRuntimeGroupStates 使用 NapCat 当前群列表预览失效的显式门禁记录。
+export function previewStalePluginRuntimeGroupStates(): Promise<RuntimeGroupStateRecord[]> {
+  return apiRequest<RuntimeGroupStateRecord[]>('/api/plugin-runtimes/group-maintenance/stale/preview', { method: 'POST' })
+}
+
+// cleanupStalePluginRuntimeGroupStates 按预览版本原子删除所选失效门禁记录。
+export function cleanupStalePluginRuntimeGroupStates(states: RuntimeGroupStateRecord[]): Promise<RuntimeGroupStateRecord[]> {
+  return apiRequest<RuntimeGroupStateRecord[]>('/api/plugin-runtimes/group-maintenance/stale/cleanup', {
+    method: 'POST',
+    body: JSON.stringify({
+      states: states.map((item) => ({ plugin_key: item.plugin_key, group_id: item.group_id, expected_version: item.version })),
+    }),
+  })
 }
 
 export interface PluginRuntimeConfigState {

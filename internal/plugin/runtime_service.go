@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/w1ndys/w1ndys-bot/internal/management"
+	"github.com/w1ndys/w1ndys-bot/internal/onebot"
 )
 
 const runtimeConfigCompensateTimeout = 10 * time.Second
@@ -21,15 +22,47 @@ type RuntimeStateStore interface {
 	FindState(context.Context, string) (PersistedPluginState, error)
 	UpdateDesiredEnabled(context.Context, management.Actor, string, bool, int64) (PersistedPluginState, error)
 	SetGroupEnabled(context.Context, management.Actor, string, int64, bool, int64) (PersistedGroupState, error)
+	CopyGroupStates(context.Context, management.Actor, int64, int64, []string, []RuntimeGroupCopyItem) ([]RuntimeGroupStateRecord, error)
+	CleanupGroupStates(context.Context, management.Actor, []RuntimeGroupStateRecord) ([]RuntimeGroupStateRecord, error)
 	FindConfig(context.Context, string) (PersistedPluginConfig, error)
 	SaveConfig(context.Context, management.Actor, string, ConfigSchema, json.RawMessage, int64) (PersistedPluginConfig, error)
 }
 
 var (
-	ErrRuntimeConfigNotSupported = errors.New("插件未声明小型配置")
-	ErrRuntimeConfigInvalid      = errors.New("插件配置无效")
-	ErrRuntimeConfigHookPanic    = errors.New("插件配置钩子发生 panic")
+	ErrRuntimeConfigNotSupported        = errors.New("插件未声明小型配置")
+	ErrRuntimeConfigInvalid             = errors.New("插件配置无效")
+	ErrRuntimeConfigHookPanic           = errors.New("插件配置钩子发生 panic")
+	ErrRuntimeGroupDirectoryUnavailable = errors.New("群目录不可用")
+	ErrRuntimeGroupNotLive              = errors.New("群不在当前机器人群列表中")
+	ErrRuntimeGroupCopySameGroup        = errors.New("源群和目标群不能相同")
+	ErrRuntimeGroupBatchEmpty           = errors.New("群开关批次不能为空")
+	ErrRuntimeGroupBatchTooLarge        = errors.New("群开关批次超过上限")
+	ErrRuntimeGroupStateDuplicate       = errors.New("群开关批次包含重复记录")
+	ErrRuntimeGroupStateNotStale        = errors.New("群开关记录不再过期")
+	ErrRuntimeGroupSourceStateNotFound  = errors.New("源群没有显式插件开关")
 )
+
+// RuntimeGroupDirectory 提供 NapCat 当前群目录；维护操作始终传入 noCache=true。
+type RuntimeGroupDirectory interface {
+	GetGroupList(context.Context, bool) ([]onebot.GroupInfo, error)
+}
+
+// RuntimeGroupCopyPreview 是源、目标实时群信息和可执行 CAS 项。
+type RuntimeGroupCopyPreview struct {
+	Source onebot.GroupInfo       `json:"source"`
+	Target onebot.GroupInfo       `json:"target"`
+	States []RuntimeGroupCopyItem `json:"states"`
+}
+
+// RuntimeGroupCopyResult 是复制提交后的目标群权威记录。
+type RuntimeGroupCopyResult struct {
+	SourceGroupID int64                     `json:"source_group_id"`
+	TargetGroupID int64                     `json:"target_group_id"`
+	States        []RuntimeGroupStateRecord `json:"states"`
+}
+
+// RuntimeStaleGroupState 是数据库存在但 NapCat 实时群目录不存在的显式开关记录。
+type RuntimeStaleGroupState = RuntimeGroupStateRecord
 
 // RuntimeConfigView 是配置管理页需要的 Schema、脱敏值与乐观锁版本。
 type RuntimeConfigView struct {
@@ -90,15 +123,16 @@ type RuntimeService struct {
 	controller *RuntimeController
 	store      RuntimeStateStore
 	authorizer RuntimeAuthorizer
+	groups     RuntimeGroupDirectory
 	locks      sync.Map
 }
 
 // NewRuntimeService 创建插件开关应用服务。
-func NewRuntimeService(catalog *SpecCatalog, controller *RuntimeController, store RuntimeStateStore, authorizer RuntimeAuthorizer) (*RuntimeService, error) {
-	if catalog == nil || controller == nil || isNilRuntimeDependency(store) || isNilRuntimeDependency(authorizer) {
+func NewRuntimeService(catalog *SpecCatalog, controller *RuntimeController, store RuntimeStateStore, authorizer RuntimeAuthorizer, groups RuntimeGroupDirectory) (*RuntimeService, error) {
+	if catalog == nil || controller == nil || isNilRuntimeDependency(store) || isNilRuntimeDependency(authorizer) || isNilRuntimeDependency(groups) {
 		return nil, errors.New("插件开关服务依赖不能为空")
 	}
-	return &RuntimeService{catalog: catalog, controller: controller, store: store, authorizer: authorizer}, nil
+	return &RuntimeService{catalog: catalog, controller: controller, store: store, authorizer: authorizer, groups: groups}, nil
 }
 
 // List 按编译期目录顺序返回全部插件的意图、运行状态和群开关。
@@ -223,6 +257,249 @@ func (s *RuntimeService) SetGroupEnabled(ctx context.Context, actor management.A
 	}
 	current.Groups = mergePersistedGroup(current.Groups, saved)
 	return s.view(spec, current), nil
+}
+
+// PreviewGroupCopy 返回两个实时群及源群全部显式插件开关的 CAS 预览。
+func (s *RuntimeService) PreviewGroupCopy(ctx context.Context, actor management.Actor, sourceGroupID, targetGroupID int64) (RuntimeGroupCopyPreview, error) {
+	if err := s.authorizer.Authorize(actor); err != nil {
+		return RuntimeGroupCopyPreview{}, err
+	}
+	live, err := s.liveGroups(ctx)
+	if err != nil {
+		return RuntimeGroupCopyPreview{}, err
+	}
+	source, target, err := validateLiveCopyGroups(live, sourceGroupID, targetGroupID)
+	if err != nil {
+		return RuntimeGroupCopyPreview{}, err
+	}
+	states, err := s.store.LoadSnapshot(ctx)
+	if err != nil {
+		return RuntimeGroupCopyPreview{}, fmt.Errorf("读取插件状态快照: %w", err)
+	}
+	items := s.groupCopyItems(states, sourceGroupID, targetGroupID)
+	if len(items) == 0 {
+		return RuntimeGroupCopyPreview{}, ErrRuntimeGroupSourceStateNotFound
+	}
+	if len(items) > RuntimeGroupBatchLimit {
+		return RuntimeGroupCopyPreview{}, ErrRuntimeGroupBatchTooLarge
+	}
+	return RuntimeGroupCopyPreview{Source: source, Target: target, States: items}, nil
+}
+
+// CopyGroupStates 使用预览版本把源群显式插件开关合并复制到实时目标群。
+func (s *RuntimeService) CopyGroupStates(ctx context.Context, actor management.Actor, sourceGroupID, targetGroupID int64, states []RuntimeGroupCopyItem) (RuntimeGroupCopyResult, error) {
+	if err := s.authorizer.Authorize(actor); err != nil {
+		return RuntimeGroupCopyResult{}, err
+	}
+	if err := validateRuntimeGroupCopyItems(sourceGroupID, targetGroupID, states); err != nil {
+		return RuntimeGroupCopyResult{}, err
+	}
+	for _, state := range states {
+		if _, err := s.spec(state.PluginKey); err != nil {
+			return RuntimeGroupCopyResult{}, err
+		}
+	}
+	live, err := s.liveGroups(ctx)
+	if err != nil {
+		return RuntimeGroupCopyResult{}, err
+	}
+	if _, _, err := validateLiveCopyGroups(live, sourceGroupID, targetGroupID); err != nil {
+		return RuntimeGroupCopyResult{}, err
+	}
+
+	allPluginKeys := make([]string, 0, len(s.catalog.Specs()))
+	for _, spec := range s.catalog.Specs() {
+		allPluginKeys = append(allPluginKeys, spec.Key)
+	}
+	unlock := s.lockPlugins(allPluginKeys)
+	defer unlock()
+
+	snapshot, err := s.store.LoadSnapshot(ctx)
+	if err != nil {
+		return RuntimeGroupCopyResult{}, fmt.Errorf("读取插件状态快照: %w", err)
+	}
+	current := s.groupCopyItems(snapshot, sourceGroupID, targetGroupID)
+	if len(current) == 0 {
+		return RuntimeGroupCopyResult{}, ErrRuntimeGroupSourceStateNotFound
+	}
+	if !equalRuntimeGroupCopyCAS(current, states) {
+		return RuntimeGroupCopyResult{}, ErrRuntimeStateConflict
+	}
+	copyPluginKeys := make([]string, 0, len(current))
+	for _, state := range current {
+		copyPluginKeys = append(copyPluginKeys, state.PluginKey)
+	}
+	previous, err := s.controller.snapshotGroupStates(targetGroupID, copyPluginKeys)
+	if err != nil {
+		return RuntimeGroupCopyResult{}, fmt.Errorf("读取目标群内存开关: %w", err)
+	}
+
+	falseStates := make(map[string]bool)
+	for _, state := range current {
+		if !state.Enabled {
+			falseStates[state.PluginKey] = false
+		}
+	}
+	if err := s.controller.SetGroupStates(targetGroupID, falseStates); err != nil {
+		return RuntimeGroupCopyResult{}, fmt.Errorf("预关闭目标群开关: %w", err)
+	}
+	saved, err := s.store.CopyGroupStates(ctx, actor, sourceGroupID, targetGroupID, allPluginKeys, current)
+	if err != nil {
+		if errors.Is(err, ErrRuntimeStateCommitUnknown) {
+			return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, fmt.Errorf("复制群开关: %w", err))
+		}
+		restoreErr := s.controller.restoreGroupStates(targetGroupID, previous)
+		return RuntimeGroupCopyResult{}, errors.Join(fmt.Errorf("复制群开关: %w", err), restoreErr)
+	}
+	if len(saved) != len(current) {
+		return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, errors.New("复制群开关返回记录数量不一致"))
+	}
+	expectedKeys := make(map[string]struct{}, len(current))
+	expectedEnabled := make(map[string]bool, len(current))
+	for _, state := range current {
+		expectedKeys[state.PluginKey] = struct{}{}
+		expectedEnabled[state.PluginKey] = state.Enabled
+	}
+	finalStates := make(map[string]bool, len(saved))
+	for index := range saved {
+		state := saved[index]
+		if state.GroupID != targetGroupID {
+			return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, errors.New("复制群开关返回了错误的目标群"))
+		}
+		if _, duplicate := finalStates[state.PluginKey]; duplicate {
+			return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, errors.New("复制群开关返回了重复插件记录"))
+		}
+		if _, found := expectedKeys[state.PluginKey]; !found {
+			return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, errors.New("复制群开关返回了未请求的插件记录"))
+		}
+		if state.Enabled != expectedEnabled[state.PluginKey] || state.Version <= 0 {
+			return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, errors.New("复制群开关返回了无效状态"))
+		}
+		saved[index].UpdatedAt = state.UpdatedAt.UTC()
+		finalStates[state.PluginKey] = state.Enabled
+	}
+	if err := s.controller.SetGroupStates(targetGroupID, finalStates); err != nil {
+		return RuntimeGroupCopyResult{}, s.closeAfterCopyCommit(targetGroupID, copyPluginKeys, fmt.Errorf("发布目标群开关: %w", err))
+	}
+	sortRuntimeGroupStateRecords(saved)
+	return RuntimeGroupCopyResult{SourceGroupID: sourceGroupID, TargetGroupID: targetGroupID, States: saved}, nil
+}
+
+// PreviewStaleGroupStates 返回数据库存在但实时群目录中不存在的显式开关。
+func (s *RuntimeService) PreviewStaleGroupStates(ctx context.Context, actor management.Actor) ([]RuntimeStaleGroupState, error) {
+	if err := s.authorizer.Authorize(actor); err != nil {
+		return nil, err
+	}
+	live, err := s.liveGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := s.store.LoadSnapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取插件状态快照: %w", err)
+	}
+	stale := make([]RuntimeStaleGroupState, 0)
+	for _, state := range snapshot {
+		for _, group := range state.Groups {
+			if _, found := live[group.GroupID]; found {
+				continue
+			}
+			stale = append(stale, RuntimeStaleGroupState{
+				PluginKey: state.PluginKey,
+				GroupID:   group.GroupID,
+				Enabled:   group.Enabled,
+				Version:   group.Version,
+				UpdatedAt: group.UpdatedAt.UTC(),
+			})
+		}
+	}
+	sortRuntimeGroupStateRecords(stale)
+	return stale, nil
+}
+
+// CleanupStaleGroupStates 重新确认群目录后，先关闭内存门禁，再以 CAS 批量删除过期记录。
+func (s *RuntimeService) CleanupStaleGroupStates(ctx context.Context, actor management.Actor, states []RuntimeStaleGroupState) ([]RuntimeStaleGroupState, error) {
+	if err := s.authorizer.Authorize(actor); err != nil {
+		return nil, err
+	}
+	if err := validateRuntimeCleanupStates(states); err != nil {
+		return nil, err
+	}
+	pluginKeys := make([]string, 0, len(states))
+	runtimePluginKeys := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		if _, found := s.catalog.Find(state.PluginKey); found {
+			runtimePluginKeys[state.PluginKey] = struct{}{}
+			pluginKeys = append(pluginKeys, state.PluginKey)
+		}
+	}
+	live, err := s.liveGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, state := range states {
+		if _, found := live[state.GroupID]; found {
+			return nil, fmt.Errorf("%w: %d", ErrRuntimeGroupStateNotStale, state.GroupID)
+		}
+	}
+
+	unlock := s.lockPlugins(pluginKeys)
+	defer unlock()
+	expected := make([]RuntimeGroupStateRecord, 0, len(states))
+	closedByGroup := make(map[int64]map[string]bool)
+	for _, state := range states {
+		expected = append(expected, RuntimeGroupStateRecord{
+			PluginKey: state.PluginKey,
+			GroupID:   state.GroupID,
+			Version:   state.Version,
+		})
+		if _, found := runtimePluginKeys[state.PluginKey]; found {
+			if closedByGroup[state.GroupID] == nil {
+				closedByGroup[state.GroupID] = make(map[string]bool)
+			}
+			closedByGroup[state.GroupID][state.PluginKey] = false
+		}
+	}
+	sortRuntimeGroupStateRecords(expected)
+	groupIDs := make([]int64, 0, len(closedByGroup))
+	for groupID := range closedByGroup {
+		groupIDs = append(groupIDs, groupID)
+	}
+	sort.Slice(groupIDs, func(i, j int) bool { return groupIDs[i] < groupIDs[j] })
+	for _, groupID := range groupIDs {
+		if err := s.controller.SetGroupStates(groupID, closedByGroup[groupID]); err != nil {
+			return nil, fmt.Errorf("预关闭过期群 %d 开关: %w", groupID, err)
+		}
+	}
+	deleted, err := s.store.CleanupGroupStates(ctx, actor, expected)
+	if err != nil {
+		return nil, fmt.Errorf("清理过期群开关: %w", err)
+	}
+	if len(deleted) != len(expected) {
+		return nil, errors.New("清理过期群开关返回记录数量不一致")
+	}
+	expectedVersions := make(map[RuntimeGroupStateKey]int64, len(expected))
+	for _, state := range expected {
+		expectedVersions[RuntimeGroupStateKey{PluginKey: state.PluginKey, GroupID: state.GroupID}] = state.Version
+	}
+	keys := make([]RuntimeGroupStateKey, 0, len(deleted))
+	for index := range deleted {
+		key := RuntimeGroupStateKey{PluginKey: deleted[index].PluginKey, GroupID: deleted[index].GroupID}
+		version, found := expectedVersions[key]
+		if !found || version != deleted[index].Version {
+			return nil, errors.New("清理过期群开关返回了无效记录")
+		}
+		delete(expectedVersions, key)
+		deleted[index].UpdatedAt = deleted[index].UpdatedAt.UTC()
+		if _, found := runtimePluginKeys[deleted[index].PluginKey]; found {
+			keys = append(keys, key)
+		}
+	}
+	if err := s.controller.DeleteGroupStates(keys); err != nil {
+		return nil, fmt.Errorf("删除过期群内存开关: %w", err)
+	}
+	sortRuntimeGroupStateRecords(deleted)
+	return deleted, nil
 }
 
 // GetConfig 返回插件配置 Schema 与脱敏后的当前值。
@@ -418,6 +695,126 @@ func (s *RuntimeService) lock(pluginKey string) func() {
 	mutex := value.(*sync.Mutex)
 	mutex.Lock()
 	return mutex.Unlock
+}
+
+func (s *RuntimeService) lockPlugins(pluginKeys []string) func() {
+	keys := append([]string(nil), pluginKeys...)
+	sort.Strings(keys)
+	unlockers := make([]func(), 0, len(keys))
+	previous := ""
+	for _, pluginKey := range keys {
+		if pluginKey == previous {
+			continue
+		}
+		unlockers = append(unlockers, s.lock(pluginKey))
+		previous = pluginKey
+	}
+	return func() {
+		for index := len(unlockers) - 1; index >= 0; index-- {
+			unlockers[index]()
+		}
+	}
+}
+
+func (s *RuntimeService) closeAfterCopyCommit(groupID int64, pluginKeys []string, cause error) error {
+	closed := make(map[string]bool, len(pluginKeys))
+	for _, pluginKey := range pluginKeys {
+		closed[pluginKey] = false
+	}
+	if err := s.controller.SetGroupStates(groupID, closed); err != nil {
+		return errors.Join(cause, fmt.Errorf("提交后关闭目标群开关: %w", err))
+	}
+	return cause
+}
+
+func (s *RuntimeService) liveGroups(ctx context.Context) (map[int64]onebot.GroupInfo, error) {
+	if s.groups == nil {
+		return nil, ErrRuntimeGroupDirectoryUnavailable
+	}
+	groups, err := s.groups.GetGroupList(ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrRuntimeGroupDirectoryUnavailable, err)
+	}
+	live := make(map[int64]onebot.GroupInfo, len(groups))
+	for _, group := range groups {
+		live[group.GroupID] = group
+	}
+	return live, nil
+}
+
+func validateLiveCopyGroups(live map[int64]onebot.GroupInfo, sourceGroupID, targetGroupID int64) (onebot.GroupInfo, onebot.GroupInfo, error) {
+	if sourceGroupID <= 0 || targetGroupID <= 0 {
+		return onebot.GroupInfo{}, onebot.GroupInfo{}, ErrInvalidRuntimeGroupID
+	}
+	if sourceGroupID == targetGroupID {
+		return onebot.GroupInfo{}, onebot.GroupInfo{}, ErrRuntimeGroupCopySameGroup
+	}
+	source, sourceFound := live[sourceGroupID]
+	target, targetFound := live[targetGroupID]
+	if !sourceFound {
+		return onebot.GroupInfo{}, onebot.GroupInfo{}, fmt.Errorf("%w: %d", ErrRuntimeGroupNotLive, sourceGroupID)
+	}
+	if !targetFound {
+		return onebot.GroupInfo{}, onebot.GroupInfo{}, fmt.Errorf("%w: %d", ErrRuntimeGroupNotLive, targetGroupID)
+	}
+	return source, target, nil
+}
+
+func (s *RuntimeService) groupCopyItems(snapshot []PersistedPluginState, sourceGroupID, targetGroupID int64) []RuntimeGroupCopyItem {
+	persisted := make(map[string]PersistedPluginState, len(snapshot))
+	for _, state := range snapshot {
+		persisted[state.PluginKey] = state
+	}
+	items := make([]RuntimeGroupCopyItem, 0)
+	for _, spec := range s.catalog.Specs() {
+		state := persisted[spec.Key]
+		source, found := findPersistedGroup(state.Groups, sourceGroupID)
+		if !found {
+			continue
+		}
+		item := RuntimeGroupCopyItem{
+			PluginKey:     spec.Key,
+			Enabled:       source.Enabled,
+			SourceVersion: source.Version,
+		}
+		if target, targetFound := findPersistedGroup(state.Groups, targetGroupID); targetFound {
+			item.TargetVersion = target.Version
+			targetEnabled := target.Enabled
+			item.TargetEnabled = &targetEnabled
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].PluginKey < items[j].PluginKey })
+	return items
+}
+
+func equalRuntimeGroupCopyCAS(current, requested []RuntimeGroupCopyItem) bool {
+	if len(current) != len(requested) {
+		return false
+	}
+	byKey := make(map[string]RuntimeGroupCopyItem, len(requested))
+	for _, item := range requested {
+		if _, duplicate := byKey[item.PluginKey]; duplicate {
+			return false
+		}
+		byKey[item.PluginKey] = item
+	}
+	for _, item := range current {
+		requestedItem, found := byKey[item.PluginKey]
+		if !found || requestedItem.Enabled != item.Enabled || requestedItem.SourceVersion != item.SourceVersion || requestedItem.TargetVersion != item.TargetVersion {
+			return false
+		}
+	}
+	return true
+}
+
+func sortRuntimeGroupStateRecords(states []RuntimeGroupStateRecord) {
+	sort.Slice(states, func(i, j int) bool {
+		if states[i].PluginKey == states[j].PluginKey {
+			return states[i].GroupID < states[j].GroupID
+		}
+		return states[i].PluginKey < states[j].PluginKey
+	})
 }
 
 func (s *RuntimeService) view(spec PluginSpec, state PersistedPluginState) RuntimeStateView {

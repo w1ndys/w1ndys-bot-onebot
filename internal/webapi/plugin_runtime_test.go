@@ -12,21 +12,52 @@ import (
 
 	"github.com/w1ndys/w1ndys-bot/internal/admin"
 	"github.com/w1ndys/w1ndys-bot/internal/management"
+	"github.com/w1ndys/w1ndys-bot/internal/onebot"
 	"github.com/w1ndys/w1ndys-bot/internal/plugin"
 )
 
 type fakeRuntimeStates struct {
-	states  []plugin.RuntimeStateView
-	state   plugin.RuntimeStateView
-	config  plugin.RuntimeConfigView
-	err     error
-	actor   management.Actor
-	key     string
-	enabled bool
-	groupID int64
-	version int64
-	payload json.RawMessage
-	calls   []string
+	states        []plugin.RuntimeStateView
+	state         plugin.RuntimeStateView
+	config        plugin.RuntimeConfigView
+	err           error
+	actor         management.Actor
+	key           string
+	enabled       bool
+	groupID       int64
+	version       int64
+	payload       json.RawMessage
+	calls         []string
+	copyPreview   plugin.RuntimeGroupCopyPreview
+	copyResult    plugin.RuntimeGroupCopyResult
+	staleStates   []plugin.RuntimeStaleGroupState
+	copySource    int64
+	copyTarget    int64
+	copyStates    []plugin.RuntimeGroupCopyItem
+	cleanupStates []plugin.RuntimeStaleGroupState
+}
+
+func (f *fakeRuntimeStates) PreviewGroupCopy(_ context.Context, actor management.Actor, sourceGroupID, targetGroupID int64) (plugin.RuntimeGroupCopyPreview, error) {
+	f.actor, f.copySource, f.copyTarget = actor, sourceGroupID, targetGroupID
+	f.calls = append(f.calls, "preview-copy")
+	return f.copyPreview, f.err
+}
+
+func (f *fakeRuntimeStates) CopyGroupStates(_ context.Context, actor management.Actor, sourceGroupID, targetGroupID int64, states []plugin.RuntimeGroupCopyItem) (plugin.RuntimeGroupCopyResult, error) {
+	f.actor, f.copySource, f.copyTarget, f.copyStates = actor, sourceGroupID, targetGroupID, states
+	f.calls = append(f.calls, "copy")
+	return f.copyResult, f.err
+}
+
+func (f *fakeRuntimeStates) PreviewStaleGroupStates(_ context.Context, actor management.Actor) ([]plugin.RuntimeStaleGroupState, error) {
+	f.actor, f.calls = actor, append(f.calls, "preview-stale")
+	return f.staleStates, f.err
+}
+
+func (f *fakeRuntimeStates) CleanupStaleGroupStates(_ context.Context, actor management.Actor, states []plugin.RuntimeStaleGroupState) ([]plugin.RuntimeStaleGroupState, error) {
+	f.actor, f.cleanupStates = actor, states
+	f.calls = append(f.calls, "cleanup-stale")
+	return f.staleStates, f.err
 }
 
 func (f *fakeRuntimeStates) GetConfig(_ context.Context, actor management.Actor, key string) (plugin.RuntimeConfigView, error) {
@@ -160,6 +191,93 @@ func TestPluginRuntimeRoutesRejectInvalidInput(t *testing.T) {
 	}
 }
 
+func TestPluginRuntimeGroupMaintenanceRoutes(t *testing.T) {
+	runtimes := &fakeRuntimeStates{
+		copyPreview: plugin.RuntimeGroupCopyPreview{
+			Source: onebot.GroupInfo{GroupID: 100, GroupName: "源群"},
+			Target: onebot.GroupInfo{GroupID: 200, GroupName: "目标群"},
+			States: []plugin.RuntimeGroupCopyItem{{PluginKey: "echo", Enabled: true, SourceVersion: 2, TargetVersion: 0}},
+		},
+		copyResult:  plugin.RuntimeGroupCopyResult{SourceGroupID: 100, TargetGroupID: 200},
+		staleStates: []plugin.RuntimeStaleGroupState{{PluginKey: "echo", GroupID: 300, Enabled: true, Version: 4}},
+	}
+	server, token := newRuntimeTestServer(t, runtimes)
+
+	previewCopy := runtimeRequest(t, server, token, http.MethodPost, "/api/plugin-runtimes/group-maintenance/copy/preview", `{"source_group_id":100,"target_group_id":200}`, "req-copy-preview")
+	if previewCopy.Code != http.StatusOK || runtimes.copySource != 100 || runtimes.copyTarget != 200 || !strings.Contains(previewCopy.Body.String(), `"group_name":"源群"`) {
+		t.Fatalf("copy preview status=%d body=%s fake=%+v", previewCopy.Code, previewCopy.Body.String(), runtimes)
+	}
+
+	copyBody := `{"source_group_id":100,"target_group_id":200,"states":[{"plugin_key":"echo","enabled":true,"source_version":2,"target_version":0}]}`
+	copyResult := runtimeRequest(t, server, token, http.MethodPost, "/api/plugin-runtimes/group-maintenance/copy", copyBody, "req-copy")
+	if copyResult.Code != http.StatusOK || len(runtimes.copyStates) != 1 || runtimes.copyStates[0].PluginKey != "echo" || runtimes.actor.RequestID != "req-copy" {
+		t.Fatalf("copy status=%d body=%s fake=%+v", copyResult.Code, copyResult.Body.String(), runtimes)
+	}
+
+	previewStale := runtimeRequest(t, server, token, http.MethodPost, "/api/plugin-runtimes/group-maintenance/stale/preview", "", "req-stale-preview")
+	if previewStale.Code != http.StatusOK || !strings.Contains(previewStale.Body.String(), `"group_id":300`) {
+		t.Fatalf("stale preview status=%d body=%s", previewStale.Code, previewStale.Body.String())
+	}
+
+	cleanupBody := `{"states":[{"plugin_key":"echo","group_id":300,"expected_version":4}]}`
+	cleanup := runtimeRequest(t, server, token, http.MethodPost, "/api/plugin-runtimes/group-maintenance/stale/cleanup", cleanupBody, "req-cleanup")
+	if cleanup.Code != http.StatusOK || len(runtimes.cleanupStates) != 1 {
+		t.Fatalf("cleanup status=%d body=%s fake=%+v", cleanup.Code, cleanup.Body.String(), runtimes)
+	}
+	item := runtimes.cleanupStates[0]
+	if item.PluginKey != "echo" || item.GroupID != 300 || item.Version != 4 || item.Enabled || !item.UpdatedAt.IsZero() {
+		t.Fatalf("cleanup service item=%+v", item)
+	}
+}
+
+func TestPluginRuntimeGroupMaintenanceRejectsInvalidInput(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "复制同群", path: "/api/plugin-runtimes/group-maintenance/copy/preview", body: `{"source_group_id":100,"target_group_id":100}`},
+		{name: "复制未知字段", path: "/api/plugin-runtimes/group-maintenance/copy/preview", body: `{"source_group_id":100,"target_group_id":200,"extra":true}`},
+		{name: "复制空状态", path: "/api/plugin-runtimes/group-maintenance/copy", body: `{"source_group_id":100,"target_group_id":200,"states":[]}`},
+		{name: "复制重复插件", path: "/api/plugin-runtimes/group-maintenance/copy", body: `{"source_group_id":100,"target_group_id":200,"states":[{"plugin_key":"echo","enabled":true,"source_version":1,"target_version":0},{"plugin_key":"echo","enabled":false,"source_version":2,"target_version":1}]}`},
+		{name: "复制坏版本", path: "/api/plugin-runtimes/group-maintenance/copy", body: `{"source_group_id":100,"target_group_id":200,"states":[{"plugin_key":"echo","enabled":true,"source_version":0,"target_version":0}]}`},
+		{name: "复制缺少源值", path: "/api/plugin-runtimes/group-maintenance/copy", body: `{"source_group_id":100,"target_group_id":200,"states":[{"plugin_key":"echo","source_version":1,"target_version":0}]}`},
+		{name: "复制缺少目标版本", path: "/api/plugin-runtimes/group-maintenance/copy", body: `{"source_group_id":100,"target_group_id":200,"states":[{"plugin_key":"echo","enabled":false,"source_version":1}]}`},
+		{name: "清理预览未知字段", path: "/api/plugin-runtimes/group-maintenance/stale/preview", body: `{"extra":true}`},
+		{name: "清理空状态", path: "/api/plugin-runtimes/group-maintenance/stale/cleanup", body: `{"states":[]}`},
+		{name: "清理重复状态", path: "/api/plugin-runtimes/group-maintenance/stale/cleanup", body: `{"states":[{"plugin_key":"echo","group_id":300,"expected_version":1},{"plugin_key":"echo","group_id":300,"expected_version":1}]}`},
+		{name: "清理坏版本", path: "/api/plugin-runtimes/group-maintenance/stale/cleanup", body: `{"states":[{"plugin_key":"echo","group_id":300,"expected_version":0}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtimes := &fakeRuntimeStates{}
+			server, token := newRuntimeTestServer(t, runtimes)
+			recorder := runtimeRequest(t, server, token, http.MethodPost, test.path, test.body, "req-invalid-maintenance")
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if len(runtimes.calls) != 0 {
+				t.Fatalf("service called: %v", runtimes.calls)
+			}
+		})
+	}
+
+	items := make([]plugin.RuntimeGroupCopyItem, plugin.RuntimeGroupBatchLimit+1)
+	for index := range items {
+		items[index] = plugin.RuntimeGroupCopyItem{PluginKey: "echo", Enabled: true, SourceVersion: 1}
+	}
+	payload, err := json.Marshal(map[string]any{"source_group_id": 100, "target_group_id": 200, "states": items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimes := &fakeRuntimeStates{}
+	server, token := newRuntimeTestServer(t, runtimes)
+	recorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugin-runtimes/group-maintenance/copy", string(payload), "req-too-large")
+	if recorder.Code != http.StatusBadRequest || len(runtimes.calls) != 0 {
+		t.Fatalf("too large status=%d body=%s calls=%v", recorder.Code, recorder.Body.String(), runtimes.calls)
+	}
+}
+
 func TestPluginRuntimeRoutesMapDomainErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -173,6 +291,11 @@ func TestPluginRuntimeRoutesMapDomainErrors(t *testing.T) {
 		{name: "正在切换", err: plugin.ErrRuntimeTransition, want: http.StatusConflict, code: "plugin_runtime_transition"},
 		{name: "需先禁用", err: plugin.ErrRuntimeRecoveryNeeded, want: http.StatusConflict, code: "plugin_runtime_recovery_needed"},
 		{name: "群号非法", err: plugin.ErrInvalidRuntimeGroupID, want: http.StatusBadRequest, code: "invalid_plugin_runtime"},
+		{name: "源群无开关", err: plugin.ErrRuntimeGroupSourceStateNotFound, want: http.StatusNotFound, code: "plugin_runtime_group_source_state_not_found"},
+		{name: "群目录不可用", err: plugin.ErrRuntimeGroupDirectoryUnavailable, want: http.StatusServiceUnavailable, code: "plugin_runtime_group_directory_unavailable"},
+		{name: "提交结果未知", err: plugin.ErrRuntimeStateCommitUnknown, want: http.StatusServiceUnavailable, code: "plugin_runtime_commit_unknown"},
+		{name: "群已退出", err: plugin.ErrRuntimeGroupNotLive, want: http.StatusConflict, code: "plugin_runtime_group_not_live"},
+		{name: "群重新出现", err: plugin.ErrRuntimeGroupStateNotStale, want: http.StatusConflict, code: "plugin_runtime_group_not_stale"},
 		{name: "无权限", err: admin.ErrForbidden, want: http.StatusForbidden, code: "forbidden"},
 	}
 	for _, test := range tests {
@@ -198,6 +321,10 @@ func TestPluginRuntimeRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodGet, path: "/api/plugin-runtimes/echo"},
 		{method: http.MethodPatch, path: "/api/plugin-runtimes/echo"},
 		{method: http.MethodPut, path: "/api/plugin-runtimes/echo/groups/100"},
+		{method: http.MethodPost, path: "/api/plugin-runtimes/group-maintenance/copy/preview"},
+		{method: http.MethodPost, path: "/api/plugin-runtimes/group-maintenance/copy"},
+		{method: http.MethodPost, path: "/api/plugin-runtimes/group-maintenance/stale/preview"},
+		{method: http.MethodPost, path: "/api/plugin-runtimes/group-maintenance/stale/cleanup"},
 		{method: http.MethodGet, path: "/api/plugin-runtimes/echo/config"},
 		{method: http.MethodPut, path: "/api/plugin-runtimes/echo/config"},
 	}

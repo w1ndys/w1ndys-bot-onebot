@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,9 +25,58 @@ type runtimeStateDatabase interface {
 var (
 	ErrRuntimeStateConflict       = errors.New("插件状态版本冲突")
 	ErrRuntimeStateInvalidVersion = errors.New("插件状态版本无效")
+	ErrRuntimeStateCommitUnknown  = errors.New("插件状态事务提交结果未知")
 	ErrRuntimeStateNotFound       = errors.New("插件状态不存在")
 	ErrRuntimeConfigNotFound      = errors.New("插件配置不存在")
 )
+
+const RuntimeGroupBatchLimit = 1000
+
+// RuntimeGroupStateKey 唯一标识一条插件逐群开关记录。
+type RuntimeGroupStateKey struct {
+	PluginKey string `json:"plugin_key"`
+	GroupID   int64  `json:"group_id"`
+}
+
+// RuntimeGroupCopyItem 是复制预览产生并由执行请求原样回传的 CAS 项。
+type RuntimeGroupCopyItem struct {
+	PluginKey     string `json:"plugin_key"`
+	Enabled       bool   `json:"enabled"`
+	SourceVersion int64  `json:"source_version"`
+	TargetVersion int64  `json:"target_version"`
+	TargetEnabled *bool  `json:"target_enabled,omitempty"`
+}
+
+// RuntimeGroupStateRecord 是带插件 Key 的权威逐群状态。
+type RuntimeGroupStateRecord struct {
+	PluginKey string    `json:"plugin_key"`
+	GroupID   int64     `json:"group_id"`
+	Enabled   bool      `json:"enabled"`
+	Version   int64     `json:"version"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type runtimeGroupBatchAudit struct {
+	SourceGroupID int64                     `json:"source_group_id,omitempty"`
+	TargetGroupID int64                     `json:"target_group_id,omitempty"`
+	States        []RuntimeGroupStateRecord `json:"states"`
+}
+
+type runtimeGroupAuditState struct {
+	PluginKey string     `json:"plugin_key"`
+	GroupID   int64      `json:"group_id"`
+	Enabled   bool       `json:"enabled"`
+	Version   int64      `json:"version"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+	Exists    bool       `json:"exists"`
+}
+
+type runtimeGroupCopyAudit struct {
+	SourceGroupID int64                    `json:"source_group_id"`
+	TargetGroupID int64                    `json:"target_group_id"`
+	SourceStates  []runtimeGroupAuditState `json:"source_states"`
+	TargetStates  []runtimeGroupAuditState `json:"target_states"`
+}
 
 // PersistedPluginConfig 是插件已持久化的原始配置值与乐观锁版本。
 type PersistedPluginConfig struct {
@@ -438,6 +488,303 @@ RETURNING group_id,enabled,version,updated_at`, pluginKey, groupID, enabled, exp
 	}
 	state.UpdatedAt = state.UpdatedAt.UTC()
 	return state, nil
+}
+
+// CopyGroupStates 使用源、目标版本 CAS 在单一事务内合并复制显式群开关并写一条汇总审计。
+func (r *PostgresRuntimeStateRepository) CopyGroupStates(ctx context.Context, actor management.Actor, sourceGroupID, targetGroupID int64, allowedPluginKeys []string, items []RuntimeGroupCopyItem) ([]RuntimeGroupStateRecord, error) {
+	if r == nil || r.database == nil {
+		return nil, fmt.Errorf("插件状态仓库未初始化")
+	}
+	if err := validateRuntimeGroupCopyItems(sourceGroupID, targetGroupID, items); err != nil {
+		return nil, err
+	}
+	allowedPluginKeys, err := validateRuntimeAllowedPluginKeys(allowedPluginKeys, items)
+	if err != nil {
+		return nil, err
+	}
+	sorted := append([]RuntimeGroupCopyItem(nil), items...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].PluginKey < sorted[j].PluginKey })
+	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return nil, fmt.Errorf("开启群开关复制事务: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+
+	sources := make(map[string]RuntimeGroupStateRecord, len(sorted))
+	targets := make(map[string]RuntimeGroupStateRecord, len(sorted))
+	groupIDs := []int64{sourceGroupID, targetGroupID}
+	sort.Slice(groupIDs, func(i, j int) bool { return groupIDs[i] < groupIDs[j] })
+	rows, err := tx.Query(ctx, `SELECT plugin_key,group_id,enabled,version,updated_at
+FROM plugin_group_states
+WHERE plugin_key=ANY($1::text[]) AND group_id=ANY($2::bigint[])
+ORDER BY plugin_key,group_id
+FOR UPDATE`, allowedPluginKeys, groupIDs)
+	if err != nil {
+		return nil, mapRuntimeBatchWriteError("锁定源群和目标群状态", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var current RuntimeGroupStateRecord
+		if err := rows.Scan(&current.PluginKey, &current.GroupID, &current.Enabled, &current.Version, &current.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("读取锁定的群开关状态: %w", err)
+		}
+		current.UpdatedAt = current.UpdatedAt.UTC()
+		if current.GroupID == sourceGroupID {
+			sources[current.PluginKey] = current
+		} else if current.GroupID == targetGroupID {
+			targets[current.PluginKey] = current
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapRuntimeBatchWriteError("遍历锁定的群开关状态", err)
+	}
+	if len(sources) != len(sorted) {
+		return nil, ErrRuntimeStateConflict
+	}
+	sourceAudit := make([]runtimeGroupAuditState, 0, len(sorted))
+	targetBeforeAudit := make([]runtimeGroupAuditState, 0, len(sorted))
+	for _, item := range sorted {
+		source, found := sources[item.PluginKey]
+		if !found || source.Enabled != item.Enabled || source.Version != item.SourceVersion {
+			return nil, ErrRuntimeStateConflict
+		}
+		target, targetFound := targets[item.PluginKey]
+		if !targetFound {
+			target = RuntimeGroupStateRecord{PluginKey: item.PluginKey, GroupID: targetGroupID}
+			targets[item.PluginKey] = target
+		}
+		if target.Version != item.TargetVersion {
+			return nil, ErrRuntimeStateConflict
+		}
+		sourceAudit = append(sourceAudit, runtimeGroupStateAudit(source, true))
+		targetBeforeAudit = append(targetBeforeAudit, runtimeGroupStateAudit(target, target.Version > 0))
+	}
+
+	after := make([]RuntimeGroupStateRecord, 0, len(sorted))
+	changed := 0
+	for _, item := range sorted {
+		target := targets[item.PluginKey]
+		if target.Version > 0 && target.Enabled == item.Enabled {
+			after = append(after, target)
+			continue
+		}
+		var saved RuntimeGroupStateRecord
+		changed++
+		saved.PluginKey, saved.GroupID = item.PluginKey, targetGroupID
+		if target.Version == 0 {
+			err = tx.QueryRow(ctx, `INSERT INTO plugin_group_states(plugin_key,group_id,enabled)
+VALUES($1,$2,$3) ON CONFLICT (plugin_key,group_id) DO NOTHING
+RETURNING enabled,version,updated_at`, item.PluginKey, targetGroupID, item.Enabled).
+				Scan(&saved.Enabled, &saved.Version, &saved.UpdatedAt)
+		} else {
+			err = tx.QueryRow(ctx, `UPDATE plugin_group_states SET enabled=$3,version=version+1,updated_at=NOW()
+WHERE plugin_key=$1 AND group_id=$2 AND version=$4
+RETURNING enabled,version,updated_at`, item.PluginKey, targetGroupID, item.Enabled, item.TargetVersion).
+				Scan(&saved.Enabled, &saved.Version, &saved.UpdatedAt)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRuntimeStateConflict
+		}
+		if err != nil {
+			return nil, mapRuntimeBatchWriteError("复制插件群开关", err)
+		}
+		saved.UpdatedAt = saved.UpdatedAt.UTC()
+		after = append(after, saved)
+	}
+	if changed == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, mapRuntimeBatchCommitError("提交群开关复制事务", err)
+		}
+		return after, nil
+	}
+	targetAfterAudit := make([]runtimeGroupAuditState, 0, len(after))
+	for _, state := range after {
+		targetAfterAudit = append(targetAfterAudit, runtimeGroupStateAudit(state, true))
+	}
+	beforeAudit := runtimeGroupCopyAudit{SourceGroupID: sourceGroupID, TargetGroupID: targetGroupID, SourceStates: sourceAudit, TargetStates: targetBeforeAudit}
+	afterAudit := runtimeGroupCopyAudit{SourceGroupID: sourceGroupID, TargetGroupID: targetGroupID, SourceStates: sourceAudit, TargetStates: targetAfterAudit}
+	if err := recordRuntimeAudit(ctx, tx, actor, "plugin.runtime.group.copy", "plugin_runtime_group", fmt.Sprintf("%d", targetGroupID), beforeAudit, afterAudit); err != nil {
+		return nil, mapRuntimeBatchWriteError("写入群开关复制审计", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, mapRuntimeBatchCommitError("提交群开关复制事务", err)
+	}
+	return after, nil
+}
+
+func runtimeGroupStateAudit(state RuntimeGroupStateRecord, exists bool) runtimeGroupAuditState {
+	audit := runtimeGroupAuditState{
+		PluginKey: state.PluginKey,
+		GroupID:   state.GroupID,
+		Enabled:   state.Enabled,
+		Version:   state.Version,
+		Exists:    exists,
+	}
+	if exists {
+		updatedAt := state.UpdatedAt.UTC()
+		audit.UpdatedAt = &updatedAt
+	}
+	return audit
+}
+
+// CleanupGroupStates 使用逐行 CAS 在单一事务内删除显式群开关并写一条汇总审计。
+func (r *PostgresRuntimeStateRepository) CleanupGroupStates(ctx context.Context, actor management.Actor, expected []RuntimeGroupStateRecord) ([]RuntimeGroupStateRecord, error) {
+	if r == nil || r.database == nil {
+		return nil, fmt.Errorf("插件状态仓库未初始化")
+	}
+	if err := validateRuntimeCleanupStates(expected); err != nil {
+		return nil, err
+	}
+	sorted := append([]RuntimeGroupStateRecord(nil), expected...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].PluginKey == sorted[j].PluginKey {
+			return sorted[i].GroupID < sorted[j].GroupID
+		}
+		return sorted[i].PluginKey < sorted[j].PluginKey
+	})
+	tx, err := r.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return nil, fmt.Errorf("开启过期群开关清理事务: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	locked := make([]RuntimeGroupStateRecord, 0, len(sorted))
+	for _, item := range sorted {
+		current := RuntimeGroupStateRecord{PluginKey: item.PluginKey, GroupID: item.GroupID}
+		err = tx.QueryRow(ctx, `SELECT enabled,version,updated_at FROM plugin_group_states WHERE plugin_key=$1 AND group_id=$2 FOR UPDATE`, item.PluginKey, item.GroupID).
+			Scan(&current.Enabled, &current.Version, &current.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && current.Version != item.Version {
+			return nil, ErrRuntimeStateConflict
+		}
+		if err != nil {
+			return nil, mapRuntimeBatchWriteError(fmt.Sprintf("锁定插件 %s 群 %d 状态", item.PluginKey, item.GroupID), err)
+		}
+		current.UpdatedAt = current.UpdatedAt.UTC()
+		locked = append(locked, current)
+	}
+	for _, item := range locked {
+		var deletedVersion int64
+		err = tx.QueryRow(ctx, `DELETE FROM plugin_group_states WHERE plugin_key=$1 AND group_id=$2 AND version=$3 RETURNING version`, item.PluginKey, item.GroupID, item.Version).
+			Scan(&deletedVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRuntimeStateConflict
+		}
+		if err != nil {
+			return nil, mapRuntimeBatchWriteError("删除过期群开关", err)
+		}
+	}
+	groups := make(map[int64]struct{}, len(locked))
+	for _, item := range locked {
+		groups[item.GroupID] = struct{}{}
+	}
+	targetID := "batch"
+	if len(groups) == 1 {
+		for groupID := range groups {
+			targetID = fmt.Sprintf("%d", groupID)
+		}
+	}
+	if err := recordRuntimeAudit(ctx, tx, actor, "plugin.runtime.group.cleanup", "plugin_runtime_group", targetID, runtimeGroupBatchAudit{States: locked}, runtimeGroupBatchAudit{States: []RuntimeGroupStateRecord{}}); err != nil {
+		return nil, mapRuntimeBatchWriteError("写入过期群开关清理审计", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, mapRuntimeBatchCommitError("提交过期群开关清理事务", err)
+	}
+	return locked, nil
+}
+
+func validateRuntimeGroupCopyItems(sourceGroupID, targetGroupID int64, items []RuntimeGroupCopyItem) error {
+	if sourceGroupID <= 0 || targetGroupID <= 0 {
+		return ErrInvalidRuntimeGroupID
+	}
+	if sourceGroupID == targetGroupID {
+		return ErrRuntimeGroupCopySameGroup
+	}
+	if len(items) == 0 {
+		return ErrRuntimeGroupBatchEmpty
+	}
+	if len(items) > RuntimeGroupBatchLimit {
+		return ErrRuntimeGroupBatchTooLarge
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if !identifierPattern.MatchString(item.PluginKey) {
+			return fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, item.PluginKey)
+		}
+		if item.SourceVersion <= 0 || item.TargetVersion < 0 {
+			return ErrRuntimeStateInvalidVersion
+		}
+		if _, duplicate := seen[item.PluginKey]; duplicate {
+			return ErrRuntimeGroupStateDuplicate
+		}
+		seen[item.PluginKey] = struct{}{}
+	}
+	return nil
+}
+
+func validateRuntimeAllowedPluginKeys(allowedPluginKeys []string, items []RuntimeGroupCopyItem) ([]string, error) {
+	if len(allowedPluginKeys) == 0 {
+		return nil, ErrRuntimePluginNotFound
+	}
+	allowed := make(map[string]struct{}, len(allowedPluginKeys))
+	for _, pluginKey := range allowedPluginKeys {
+		if !identifierPattern.MatchString(pluginKey) {
+			return nil, fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, pluginKey)
+		}
+		if _, duplicate := allowed[pluginKey]; duplicate {
+			return nil, ErrRuntimeGroupStateDuplicate
+		}
+		allowed[pluginKey] = struct{}{}
+	}
+	for _, item := range items {
+		if _, found := allowed[item.PluginKey]; !found {
+			return nil, fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, item.PluginKey)
+		}
+	}
+	keys := append([]string(nil), allowedPluginKeys...)
+	sort.Strings(keys)
+	return keys, nil
+}
+
+func validateRuntimeCleanupStates(states []RuntimeGroupStateRecord) error {
+	if len(states) == 0 {
+		return ErrRuntimeGroupBatchEmpty
+	}
+	if len(states) > RuntimeGroupBatchLimit {
+		return ErrRuntimeGroupBatchTooLarge
+	}
+	seen := make(map[RuntimeGroupStateKey]struct{}, len(states))
+	for _, state := range states {
+		if !identifierPattern.MatchString(state.PluginKey) {
+			return fmt.Errorf("%w: %s", ErrRuntimePluginNotFound, state.PluginKey)
+		}
+		if state.GroupID <= 0 {
+			return ErrInvalidRuntimeGroupID
+		}
+		if state.Version <= 0 {
+			return ErrRuntimeStateInvalidVersion
+		}
+		key := RuntimeGroupStateKey{PluginKey: state.PluginKey, GroupID: state.GroupID}
+		if _, duplicate := seen[key]; duplicate {
+			return ErrRuntimeGroupStateDuplicate
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func mapRuntimeBatchWriteError(operation string, err error) error {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && (postgresError.Code == "23505" || postgresError.Code == "40001" || postgresError.Code == "40P01") {
+		return ErrRuntimeStateConflict
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func mapRuntimeBatchCommitError(operation string, err error) error {
+	mapped := mapRuntimeBatchWriteError(operation, err)
+	if errors.Is(mapped, ErrRuntimeStateConflict) {
+		return mapped
+	}
+	return errors.Join(ErrRuntimeStateCommitUnknown, mapped)
 }
 
 // recordRuntimeAudit 在状态写入所在事务追加审计；before 为 nil 表示新增。

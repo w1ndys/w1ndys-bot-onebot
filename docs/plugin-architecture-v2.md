@@ -86,6 +86,22 @@ admin_audit_logs(...)
 
 开关写入必须鉴权、审计、使用乐观锁并保持幂等。启用完成前不接流量；禁用先停止新调用，等待在途 Handler，再释放资源。生命周期方法必须幂等、可取消并隔离 panic。
 
+平台支持两类跨记录群门禁运维，并统一采用“预览 → 携带版本确认执行”：
+
+- 群间复制采用合并语义，只复制源群显式存在的插件开关，保留目标群独有记录；源值、源版本和目标版本必须与预览一致，整批在一个事务内完成。
+- 失效清理以 NapCat 当前群列表为权威，只删除 `plugin_group_states` 中已不在群列表的所选记录；执行时群重新出现或记录版本变化都会使整批回滚。
+- 同值复制不递增版本，完全无变化时不写无意义审计；每个有效批次只写一条汇总审计。
+- 批量关闭在数据库提交前先收紧进程内门禁，批量开启只在提交成功后发布，数据库或内存发布异常时保持 fail-closed。
+
+对应管理 API 均要求 WebUI JWT 和服务层二次管理员授权：
+
+```text
+POST /api/plugin-runtimes/group-maintenance/copy/preview
+POST /api/plugin-runtimes/group-maintenance/copy
+POST /api/plugin-runtimes/group-maintenance/stale/preview
+POST /api/plugin-runtimes/group-maintenance/stale/cleanup
+```
+
 ## 6. 配置与业务数据
 
 使用唯一分类规则：
@@ -108,6 +124,7 @@ admin_audit_logs(...)
 
 - 登录、管理员授权、插件导航。
 - 全局开关、群开关、运行状态和错误。
+- 群开关的跨群合并复制，以及已经退出群的失效门禁预览与清理。
 - 每个插件独立路由的小型配置表单和全局 Toast。
 - 公共表格、分页、筛选、表单弹窗、确认框、状态标签和群选择器。
 - API 错误映射、时间展示和响应式布局。

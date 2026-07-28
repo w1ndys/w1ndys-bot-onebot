@@ -187,6 +187,158 @@ async function testVersionConflictKeepsState({ page }: { page: Page }): Promise<
 test('目标插件可启用并开启单群', testEnablePluginAndGroup)
 test('乐观锁冲突后回到权威状态', testVersionConflictKeepsState)
 
+test('群开关维护按预览版本复制并默认不选择失效记录', async ({ page }) => {
+  await seedSession(page)
+  let maintenanceRequests = 0
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const method = request.method()
+    if (method === 'GET' && path === '/api/plugin-runtimes') {
+      await fulfill(route, [buildState()])
+      return
+    }
+    maintenanceRequests += 1
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/copy/preview') {
+      expect(request.postDataJSON()).toEqual({ source_group_id: 100, target_group_id: 200 })
+      await fulfill(route, {
+        source: { group_id: 100, group_name: '源群' },
+        target: { group_id: 200, group_name: '目标群' },
+        states: [{ plugin_key: 'echo', enabled: true, source_version: 3, target_version: 2, target_enabled: false }],
+      })
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/copy') {
+      expect(request.postDataJSON()).toEqual({
+        source_group_id: 100,
+        target_group_id: 200,
+        states: [{ plugin_key: 'echo', enabled: true, source_version: 3, target_version: 2 }],
+      })
+      await fulfill(route, { source_group_id: 100, target_group_id: 200, states: [{ plugin_key: 'echo', group_id: 200, enabled: true, version: 3, updated_at: '2026-07-28T00:00:00Z' }] })
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/stale/preview') {
+      await fulfill(route, [{ plugin_key: 'echo', group_id: 300, enabled: true, version: 4, updated_at: '2026-07-27T00:00:00Z' }])
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/stale/cleanup') {
+      expect(request.postDataJSON()).toEqual({ states: [{ plugin_key: 'echo', group_id: 300, expected_version: 4 }] })
+      await fulfill(route, [{ plugin_key: 'echo', group_id: 300, enabled: true, version: 4, updated_at: '2026-07-27T00:00:00Z' }])
+      return
+    }
+    throw new Error(`未处理群开关维护API：${method} ${path}`)
+  })
+
+  await page.goto('/plugin-runtimes')
+  await expect(page.getByText('群开关维护')).toBeVisible()
+  // 页面首次加载只读数据库运行状态，不主动触发 NapCat 群列表查询。
+  expect(maintenanceRequests).toBe(0)
+  const maintenance = page.locator('.n-card').filter({ hasText: '群开关维护' })
+  await maintenance.getByPlaceholder('源 QQ 群号').fill('100')
+  await maintenance.getByPlaceholder('目标 QQ 群号').fill('200')
+  await maintenance.getByRole('button', { name: '预览复制' }).click()
+  await expect(maintenance.getByText('源群（100） → 目标群：目标群（200）')).toBeVisible()
+  await expect(maintenance.getByText('修改', { exact: true })).toBeVisible()
+  await maintenance.getByRole('button', { name: '确认复制到目标群' }).click()
+  await page.getByRole('button', { name: '确认复制', exact: true }).click()
+  await expect(page.getByText('已将 1 个插件开关复制到群 200')).toBeVisible()
+
+  await maintenance.getByRole('button', { name: '预览失效记录' }).click()
+  await expect(maintenance.getByText('300', { exact: true })).toBeVisible()
+  const cleanupButton = maintenance.getByRole('button', { name: '清理所选 0 条' })
+  await expect(cleanupButton).toBeDisabled()
+  await maintenance.getByRole('row', { name: /Echo 回声.*300/ }).getByRole('checkbox').click()
+  await maintenance.getByRole('button', { name: '清理所选 1 条' }).click()
+  await page.getByRole('button', { name: '确认清理', exact: true }).click()
+  await expect(page.getByText('已清理 1 条失效群开关记录')).toBeVisible()
+})
+
+test('群目录查询失败不会伪装为无失效记录', async ({ page }) => {
+  await seedSession(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    if (request.method() === 'GET' && path === '/api/plugin-runtimes') {
+      await fulfill(route, [buildState()])
+      return
+    }
+    if (request.method() === 'POST' && path === '/api/plugin-runtimes/group-maintenance/stale/preview') {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ code: 'plugin_runtime_group_directory_unavailable', message: '无法读取机器人当前群列表，请稍后重试', data: null }) })
+      return
+    }
+    throw new Error(`未处理群目录失败API：${request.method()} ${path}`)
+  })
+
+  await page.goto('/plugin-runtimes')
+  await page.getByRole('button', { name: '预览失效记录' }).click()
+  await expect(page.getByText('失效记录预览失败')).toBeVisible()
+  await expect(page.locator('#app').getByText('无法读取机器人当前群列表，请稍后重试')).toBeVisible()
+  await expect(page.getByText('没有失效的群开关记录')).toHaveCount(0)
+})
+
+test('群开关维护冲突会丢弃预览且重复确认只写一次', async ({ page }) => {
+  await seedSession(page)
+  let copyWrites = 0
+  let cleanupWrites = 0
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const method = request.method()
+    if (method === 'GET' && path === '/api/plugin-runtimes') {
+      await fulfill(route, [buildState()])
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/copy/preview') {
+      await fulfill(route, {
+        source: { group_id: 100, group_name: '源群' },
+        target: { group_id: 200, group_name: '目标群' },
+        states: [{ plugin_key: 'echo', enabled: true, source_version: 3, target_version: 0 }],
+      })
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/copy') {
+      copyWrites += 1
+      await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ code: 'plugin_runtime_conflict', message: '复制预览已过期', data: null }) })
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/stale/preview') {
+      await fulfill(route, [{ plugin_key: 'echo', group_id: 300, enabled: true, version: 4, updated_at: '2026-07-27T00:00:00Z' }])
+      return
+    }
+    if (method === 'POST' && path === '/api/plugin-runtimes/group-maintenance/stale/cleanup') {
+      cleanupWrites += 1
+      await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ code: 'plugin_runtime_conflict', message: '失效群开关预览已过期', data: null }) })
+      return
+    }
+    throw new Error(`未处理群开关冲突API：${method} ${path}`)
+  })
+
+  await page.goto('/plugin-runtimes')
+  const maintenance = page.locator('.n-card').filter({ hasText: '群开关维护' })
+  await maintenance.getByPlaceholder('源 QQ 群号').fill('100')
+  await maintenance.getByPlaceholder('目标 QQ 群号').fill('200')
+  await maintenance.getByRole('button', { name: '预览复制' }).click()
+  await maintenance.getByRole('button', { name: '确认复制到目标群' }).click()
+  await page.getByRole('button', { name: '确认复制', exact: true }).evaluate((button: HTMLButtonElement) => {
+    button.click()
+    button.click()
+  })
+  await expect(page.locator('#app').getByText('复制预览已过期')).toBeVisible()
+  await expect(maintenance.getByRole('button', { name: '确认复制到目标群' })).toHaveCount(0)
+  expect(copyWrites).toBe(1)
+
+  await maintenance.getByRole('button', { name: '预览失效记录' }).click()
+  await maintenance.getByRole('row', { name: /Echo 回声.*300/ }).getByRole('checkbox').click()
+  await maintenance.getByRole('button', { name: '清理所选 1 条' }).click()
+  await page.getByRole('button', { name: '确认清理', exact: true }).evaluate((button: HTMLButtonElement) => {
+    button.click()
+    button.click()
+  })
+  await expect(page.locator('#app').getByText('失效群开关预览已过期')).toBeVisible()
+  await expect(maintenance.getByRole('button', { name: /清理所选/ })).toHaveCount(0)
+  expect(cleanupWrites).toBe(1)
+})
+
 // mockRuntimeConfig 模拟带小型配置的插件运行状态与配置读写。
 // @param page：Playwright页面。
 // @returns Promise，返回已发生的配置读取次数查询函数。

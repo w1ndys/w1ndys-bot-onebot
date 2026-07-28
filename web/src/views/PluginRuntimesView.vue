@@ -1,9 +1,23 @@
-<!-- 📌 影响范围：读写目标架构插件的全局与逐群开关；手工输入 QQ 群号。 -->
+<!-- 📌 影响范围：读写目标架构插件的全局与逐群开关；提供群门禁复制与失效记录清理。 -->
 <script setup lang="ts">
-import { NAlert, NButton, NCard, NDataTable, NEmpty, NInput, NSpace, NSwitch, NTag, type DataTableColumns } from 'naive-ui'
-import { h, onMounted, reactive, ref } from 'vue'
+import { NAlert, NButton, NCard, NDataTable, NEmpty, NInput, NPopconfirm, NSpace, NSwitch, NTag, type DataTableColumns } from 'naive-ui'
+import { computed, h, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { listPluginRuntimes, setPluginRuntimeEnabled, setPluginRuntimeGroupEnabled, type PluginRuntimeCommand, type PluginRuntimeGroup, type PluginRuntimeState } from '../api'
+import {
+  cleanupStalePluginRuntimeGroupStates,
+  copyPluginRuntimeGroupStates,
+  listPluginRuntimes,
+  previewPluginRuntimeGroupCopy,
+  previewStalePluginRuntimeGroupStates,
+  setPluginRuntimeEnabled,
+  setPluginRuntimeGroupEnabled,
+  type PluginRuntimeCommand,
+  type PluginRuntimeGroup,
+  type PluginRuntimeState,
+  type RuntimeGroupCopyItem,
+  type RuntimeGroupCopyPreview,
+  type RuntimeGroupStateRecord,
+} from '../api'
 import { useAppFeedback } from '../feedback'
 
 const feedback = useAppFeedback()
@@ -12,6 +26,15 @@ const loading = ref(false)
 const saving = ref(false)
 const errorMessage = ref('')
 const groupInputs = reactive<Record<string, string>>({})
+const copySourceInput = ref('')
+const copyTargetInput = ref('')
+const copyPreview = ref<RuntimeGroupCopyPreview | null>(null)
+const copyError = ref('')
+const copyBusy = ref(false)
+const stalePreview = ref<RuntimeGroupStateRecord[] | null>(null)
+const staleError = ref('')
+const staleBusy = ref(false)
+const selectedStaleKeys = ref<Array<string | number>>([])
 let loadSequence = 0
 let mutationSequence = 0
 
@@ -259,6 +282,142 @@ function buildGroupColumns(state: PluginRuntimeState): DataTableColumns<PluginRu
   return result
 }
 
+function parseGroupID(raw: string): number | null {
+  if (!/^[1-9]\d{0,18}$/.test(raw)) return null
+  const value = Number(raw)
+  return Number.isSafeInteger(value) ? value : null
+}
+
+function updateCopyInput(target: 'source' | 'target', value: string): void {
+  if (target === 'source') copySourceInput.value = value
+  else copyTargetInput.value = value
+  copyPreview.value = null
+  copyError.value = ''
+}
+
+async function previewCopy(): Promise<void> {
+  const sourceGroupID = parseGroupID(copySourceInput.value)
+  const targetGroupID = parseGroupID(copyTargetInput.value)
+  if (sourceGroupID === null || targetGroupID === null) {
+    feedback.warning('请输入正确的源群号和目标群号')
+    return
+  }
+  if (sourceGroupID === targetGroupID) {
+    feedback.warning('源群和目标群不能相同')
+    return
+  }
+  copyBusy.value = true
+  copyError.value = ''
+  copyPreview.value = null
+  try {
+    const preview = await previewPluginRuntimeGroupCopy(sourceGroupID, targetGroupID)
+    copyPreview.value = preview
+    feedback.success(`复制预览完成，共 ${preview.states.length} 个显式插件开关`)
+  } catch (error) {
+    copyError.value = error instanceof Error ? error.message : '生成群开关复制预览失败'
+    feedback.error(error, '生成群开关复制预览失败')
+  } finally {
+    copyBusy.value = false
+  }
+}
+
+async function executeCopy(): Promise<void> {
+  const preview = copyPreview.value
+  if (preview === null || preview.states.length === 0 || copyBusy.value) return
+  copyBusy.value = true
+  copyError.value = ''
+  try {
+    const result = await copyPluginRuntimeGroupStates(preview)
+    copyPreview.value = null
+    feedback.success(`已将 ${result.states.length} 个插件开关复制到群 ${result.target_group_id}`)
+    await loadStates()
+  } catch (error) {
+    copyPreview.value = null
+    copyError.value = error instanceof Error ? error.message : '复制群开关失败，请重新预览'
+    feedback.error(error, '复制群开关失败', '，请重新预览')
+  } finally {
+    copyBusy.value = false
+  }
+}
+
+async function previewStale(): Promise<void> {
+  if (staleBusy.value) return
+  staleBusy.value = true
+  staleError.value = ''
+  stalePreview.value = null
+  selectedStaleKeys.value = []
+  try {
+    const preview = await previewStalePluginRuntimeGroupStates()
+    stalePreview.value = preview
+    feedback.success(`失效记录预览完成，共 ${preview.length} 条`)
+  } catch (error) {
+    staleError.value = error instanceof Error ? error.message : '生成失效群开关预览失败'
+    feedback.error(error, '生成失效群开关预览失败')
+  } finally {
+    staleBusy.value = false
+  }
+}
+
+function staleStateKey(item: RuntimeGroupStateRecord): string {
+  return `${item.plugin_key}:${item.group_id}`
+}
+
+const selectedStaleStates = computed(() => {
+  const selected = new Set(selectedStaleKeys.value.map(String))
+  return (stalePreview.value ?? []).filter((item) => selected.has(staleStateKey(item)))
+})
+
+async function executeStaleCleanup(): Promise<void> {
+  const selected = selectedStaleStates.value
+  if (selected.length === 0 || staleBusy.value) return
+  staleBusy.value = true
+  staleError.value = ''
+  try {
+    const deleted = await cleanupStalePluginRuntimeGroupStates(selected)
+    stalePreview.value = null
+    selectedStaleKeys.value = []
+    feedback.success(`已清理 ${deleted.length} 条失效群开关记录`)
+    await loadStates()
+  } catch (error) {
+    stalePreview.value = null
+    selectedStaleKeys.value = []
+    staleError.value = error instanceof Error ? error.message : '清理失效群开关失败，请重新预览'
+    feedback.error(error, '清理失效群开关失败', '，请重新预览')
+  } finally {
+    staleBusy.value = false
+  }
+}
+
+function pluginLabel(pluginKey: string): string {
+  const state = states.value.find((item) => item.plugin_key === pluginKey)
+  return state === undefined ? pluginKey : `${state.display_name}（${pluginKey}）`
+}
+
+function targetStateLabel(item: RuntimeGroupCopyItem): string {
+  if (item.target_enabled === undefined || item.target_enabled === null) return '无显式记录'
+  return item.target_enabled ? '开启' : '关闭'
+}
+
+function copyChangeLabel(item: RuntimeGroupCopyItem): string {
+  if (item.target_enabled === undefined || item.target_enabled === null) return '新增'
+  return item.target_enabled === item.enabled ? '保持不变' : '修改'
+}
+
+const copyColumns: DataTableColumns<RuntimeGroupCopyItem> = [
+  { title: '插件', key: 'plugin_key', render: (item) => pluginLabel(item.plugin_key) },
+  { title: '源群', key: 'enabled', render: (item) => h(NTag, { type: item.enabled ? 'success' : 'default' }, { default: () => (item.enabled ? '开启' : '关闭') }) },
+  { title: '目标群当前值', key: 'target_enabled', render: targetStateLabel },
+  { title: '执行结果', key: 'change', render: copyChangeLabel },
+]
+
+const staleColumns: DataTableColumns<RuntimeGroupStateRecord> = [
+  { type: 'selection' },
+  { title: '插件', key: 'plugin_key', render: (item) => pluginLabel(item.plugin_key) },
+  { title: '群号', key: 'group_id' },
+  { title: '开关值', key: 'enabled', render: (item) => (item.enabled ? '开启' : '关闭') },
+  { title: '版本', key: 'version' },
+]
+
 const commandColumns: DataTableColumns<PluginRuntimeCommand> = [
   { title: '命令', key: 'display_name' },
   { title: '触发词', key: 'triggers', render: (item) => item.triggers.join('、') },
@@ -275,6 +434,60 @@ onMounted(loadStates)
       <span>触发词与允许身份由代码持有，此处只读展示；数据库仅保存开关意图。</span>
       <NButton :disabled="loading || saving" @click="loadStates">刷新</NButton>
     </NSpace>
+    <NCard title="群开关维护">
+      <NAlert type="warning" title="操作边界">
+        复制采用合并模式，只覆盖源群显式存在的插件开关；清理只删除已经退出群的门禁记录，不删除关键词、违规记录、训练样本等插件业务数据。
+      </NAlert>
+      <div class="maintenance-grid">
+        <NSpace vertical>
+          <h3>按群复制插件开关</h3>
+          <div class="maintenance-form">
+            <NInput class="group-id-input" :value="copySourceInput" :disabled="copyBusy" placeholder="源 QQ 群号" @update:value="(value: string) => updateCopyInput('source', value)" />
+            <NInput class="group-id-input" :value="copyTargetInput" :disabled="copyBusy" placeholder="目标 QQ 群号" @update:value="(value: string) => updateCopyInput('target', value)" />
+            <NButton :loading="copyBusy" :disabled="copyBusy" @click="previewCopy">预览复制</NButton>
+          </div>
+          <NAlert v-if="copyError" type="error" title="复制预览失败">{{ copyError }}</NAlert>
+          <template v-if="copyPreview">
+            <span>源群：{{ copyPreview.source.group_name || '未命名群' }}（{{ copyPreview.source.group_id }}） → 目标群：{{ copyPreview.target.group_name || '未命名群' }}（{{ copyPreview.target.group_id }}）</span>
+            <NDataTable :columns="copyColumns" :data="copyPreview.states" :bordered="false" :scroll-x="680" size="small" />
+            <NEmpty v-if="copyPreview.states.length === 0" description="源群没有显式插件开关，无需复制" />
+            <NPopconfirm v-else positive-text="确认复制" negative-text="取消" @positive-click="executeCopy">
+              <template #trigger><NButton type="primary" :disabled="copyBusy">确认复制到目标群</NButton></template>
+              将按当前预览版本原子复制 {{ copyPreview.states.length }} 个开关，确认继续？
+            </NPopconfirm>
+          </template>
+        </NSpace>
+        <NSpace vertical>
+          <h3>清理已退出群的开关记录</h3>
+          <span>预览会主动读取 NapCat 当前群列表；候选项默认不选中，执行前会再次核验。</span>
+          <NButton :loading="staleBusy" :disabled="staleBusy" @click="previewStale">预览失效记录</NButton>
+          <NAlert v-if="staleError" type="error" title="失效记录预览失败">{{ staleError }}</NAlert>
+          <template v-if="stalePreview !== null">
+            <NDataTable
+              v-if="stalePreview.length > 0"
+              v-model:checked-row-keys="selectedStaleKeys"
+              :columns="staleColumns"
+              :data="stalePreview"
+              :row-key="staleStateKey"
+              :bordered="false"
+              :scroll-x="650"
+              size="small"
+            />
+            <NEmpty v-else description="没有失效的群开关记录" />
+            <NPopconfirm
+              v-if="stalePreview.length > 0"
+              positive-text="确认清理"
+              negative-text="取消"
+              :disabled="selectedStaleStates.length === 0 || staleBusy"
+              @positive-click="executeStaleCleanup"
+            >
+              <template #trigger><NButton type="error" :disabled="selectedStaleStates.length === 0 || staleBusy">清理所选 {{ selectedStaleStates.length }} 条</NButton></template>
+              只删除所选插件群门禁，插件业务数据会保留。确认继续？
+            </NPopconfirm>
+          </template>
+        </NSpace>
+      </div>
+    </NCard>
     <NEmpty v-if="!loading && states.length === 0" description="当前二进制没有目标架构插件" />
     <NCard v-for="state in states" :key="state.plugin_key" :title="state.display_name" :loading="loading">
       <template #header-extra>
@@ -308,3 +521,26 @@ onMounted(loadStates)
     </NCard>
   </NSpace>
 </template>
+
+<style scoped>
+.maintenance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 24px;
+  margin-top: 20px;
+}
+
+.maintenance-grid h3 {
+  margin: 0;
+}
+
+.maintenance-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.group-id-input {
+  flex: 1 1 180px;
+}
+</style>
