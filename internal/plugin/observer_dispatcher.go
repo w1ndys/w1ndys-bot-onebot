@@ -43,6 +43,11 @@ func NewObserverDispatcher(catalog *SpecCatalog, gate RuntimeGate) (*ObserverDis
 
 // Dispatch 调用所有匹配且通过全局、群门禁的观察器。
 func (d *ObserverDispatcher) Dispatch(ctx context.Context, event ws.Event) (int, error) {
+	return d.DispatchPhase(ctx, event, ObserverPhaseAfterCommands)
+}
+
+// DispatchPhase 调用指定阶段中所有匹配且通过全局、群门禁的观察器。
+func (d *ObserverDispatcher) DispatchPhase(ctx context.Context, event ws.Event, phase ObserverPhase) (int, error) {
 	kind, groupID, accepted := classifyObserverEvent(event)
 	if !accepted {
 		return 0, nil
@@ -50,6 +55,9 @@ func (d *ObserverDispatcher) Dispatch(ctx context.Context, event ws.Event) (int,
 	handled := 0
 	var dispatchErrors []error
 	for _, route := range d.routes {
+		if route.observer.Phase != phase {
+			continue
+		}
 		if _, subscribed := route.kinds[kind]; !subscribed {
 			continue
 		}

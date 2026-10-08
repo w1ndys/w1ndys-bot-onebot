@@ -41,7 +41,7 @@ QQ：最小应急入口
 compiled plugin package → PluginSpec → SpecCatalog → RuntimeController → Dispatcher
 ```
 
-目标 `PluginSpec` 声明稳定 Key、展示信息、命令、可选观察器、可选配置、可选生命周期和可选管理页面键。命令声明稳定 Key、触发词、群消息作用域、`AllowedRoles` 和 Handler。`ObserverSpec` 声明稳定 Key、平台支持的群事件类型和 Observer Handler；观察器没有命令身份语义，但始终经过全局和群门禁。纯后台插件通过生命周期启动任务，并使用受限的群门禁查询能力保护每次群副作用。
+目标 `PluginSpec` 声明稳定 Key、展示信息、命令、可选观察器、可选配置、可选生命周期和可选管理页面键。命令声明稳定 Key、触发词、群消息作用域、`AllowedRoles` 和 Handler。`ObserverSpec` 声明稳定 Key、平台支持的群事件类型、执行阶段和 Observer Handler；零值阶段保持“命令未命中后观察”，安全监控可声明 `before_commands` 在命令匹配前观察。观察器没有命令身份语义，但两个阶段都始终经过全局和群门禁。纯后台插件通过生命周期启动任务，并使用受限的群门禁查询能力保护每次群副作用。
 
 启动时拒绝重复插件 Key、命令 Key、观察器 Key、触发词、空身份集合、空观察事件集合和不受支持的事件类型。插件不得绕过 Dispatcher 向全局事件链私自注册命令或观察器。前后端插件页面均编译进程序，不加载远程代码。
 
@@ -69,7 +69,7 @@ compiled plugin package → PluginSpec → SpecCatalog → RuntimeController →
 
 目标架构中的普通插件只处理群消息，身份使用封闭集合：`super_admin`、`group_owner`、`group_admin`、`group_member`。私聊消息在群门禁前拒绝，不进入普通插件；QQ 应急管理入口属于平台管理服务，不复用普通插件命令授权链。若未来出现真实私聊插件需求，必须先设计独立的私聊投放门禁，不能静默绕过群开关。
 
-观察型插件处理未匹配的群事件时仍必须经过全局 `Ready` 和当前群 `Enabled`，但不执行命令身份检查；插件不得自行订阅绕过 Dispatcher。后台任务由全局生命周期启动和停止，停止时必须取消并排空；任何面向具体群的后台副作用都必须在执行前重新检查该群开关。
+观察型插件默认处理未匹配的群事件；需要覆盖命令消息的安全监控必须显式声明命令前阶段。两类观察器都必须经过全局 `Ready` 和当前群 `Enabled`，但不执行命令身份检查；命令前观察器失败时停止当前事件继续进入命令和默认观察器，避免安全检查故障时静默绕过。插件不得自行订阅绕过 Dispatcher。后台任务由全局生命周期启动和停止，停止时必须取消并排空；任何面向具体群的后台副作用都必须在执行前重新检查该群开关。
 
 ## 5. 状态、群开关与生命周期
 
@@ -168,16 +168,20 @@ web/src/plugins/{plugin}/
 
 ## 10. 违禁词监控示例
 
-- 阈值、模型开关等有限参数使用小型配置。
-- 违规记录、历史、训练样本和候选词使用插件自有业务表。
-- 审核、误报和文本试判使用语义明确的专属 API。
+- 直接处置权重阈值、模型开关、清洗后文本长度门槛等有限参数使用小型配置。
+- 单一正权重违禁词、活跃成员白名单、违规记录和模型用量使用插件自有业务表。
+- 消息先删除 CQ/媒体段和噪音字符；高分直接处置，未达本地阈值但清洗后足够长的消息（包括零分消息）交给大模型。
+- 违规复核、误报、文本试判和加权词 CRUD 使用语义明确的专属 API；词条编辑使用乐观锁。
 - `ForbiddenMonitorPage.vue` 使用公共表格、筛选、确认框和 Toast 组合专属页面。
 
 ```text
-GET  /api/plugins/forbidden-message-monitor/groups/{group}/violations
-POST /api/plugins/forbidden-message-monitor/groups/{group}/violations/{id}/confirm
-POST /api/plugins/forbidden-message-monitor/groups/{group}/violations/{id}/mark-false-positive
-POST /api/plugins/forbidden-message-monitor/groups/{group}/text-trials
+GET    /api/plugins/forbidden_message_monitor/violations
+POST   /api/plugins/forbidden_message_monitor/violations/{id}/review
+POST   /api/plugins/forbidden_message_monitor/text-trials
+GET    /api/plugins/forbidden_message_monitor/terms
+POST   /api/plugins/forbidden_message_monitor/terms
+PUT    /api/plugins/forbidden_message_monitor/terms/{id}
+DELETE /api/plugins/forbidden_message_monitor/terms/{id}
 ```
 
 ## 11. QQ 应急入口

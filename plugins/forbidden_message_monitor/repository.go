@@ -1,17 +1,14 @@
-// 📌 影响范围：读写 PostgreSQL 违禁监控业务表与管理审计日志；误判复核会原子写入反馈样本。
+// 📌 影响范围：读写 PostgreSQL 违禁监控业务表与管理审计日志；不调用外部服务。
 package forbiddenmessagemonitor
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,17 +38,7 @@ type monitorRepository interface {
 	CompleteViolationActions(context.Context, int64, moderationOutcome) error
 	GetViolation(context.Context, int64) (storedViolation, error)
 	TransitionByEvent(context.Context, management.Actor, int64, int64, time.Time, time.Time, string) (bool, error)
-	RecentExamples(context.Context, int64, string, int) ([]reviewExample, error)
-	BehaviorSummary(context.Context, int64, int64, time.Time) (behaviorSummary, error)
-	FeedbackKeywordCounts(context.Context, time.Time) (map[string]int, error)
-	RefreshWeightOffsets(context.Context, time.Time, time.Time, []weightOffset) error
-	ActiveWeightOffsets(context.Context, time.Time) (map[string]float64, error)
-	LearnedKeywordWeights(context.Context) (map[string]float64, error)
 	TryReserveLLMRequest(context.Context, time.Time, int) (bool, error)
-	TrainingSampleExists(context.Context, string) (bool, error)
-	CreateTrainingSample(context.Context, management.Actor, string, []string) (management.ResourceRecord, error)
-	ListTrainingSamples(context.Context, management.ResourceQuery) (management.ResourcePage, error)
-	DeleteTrainingSample(context.Context, management.Actor, int64, int64) error
 	ListPending(context.Context, management.ResourceQuery) (management.ResourcePage, error)
 	Review(context.Context, management.Actor, int64, int64, string) (management.ResourceRecord, error)
 	BeginFalsePositive(context.Context, int64, int64) (storedViolation, error)
@@ -67,7 +54,7 @@ type violationCreate struct {
 	GroupID         int64
 	UserID          int64
 	DetectionSource string
-	RiskScore       *int
+	RiskScore       *float64
 	Reason          string
 	Violations      []string
 	ActionResult    json.RawMessage
@@ -81,7 +68,7 @@ type violationData struct {
 	UserID          int64           `json:"user_id"`
 	Status          string          `json:"status"`
 	DetectionSource string          `json:"detection_source"`
-	RiskScore       *int            `json:"risk_score,omitempty"`
+	RiskScore       *float64        `json:"risk_score,omitempty"`
 	Reason          string          `json:"reason"`
 	Violations      json.RawMessage `json:"violations"`
 	ActionResult    json.RawMessage `json:"action_result"`
@@ -98,62 +85,6 @@ type storedViolation struct {
 
 type reviewPayload struct {
 	Status string `json:"status"`
-}
-
-type reviewExample struct {
-	MessageContent string
-	IsViolation    bool
-	MarkedAt       time.Time
-}
-
-type behaviorSummary struct {
-	ValidSpeechCount int
-	ViolationCount   int
-	LastMessageTime  *time.Time
-}
-
-type weightOffset struct {
-	Keyword     string
-	WeightDelta float64
-	SampleCount int
-}
-
-type trainingSampleData struct {
-	MessageContent string    `json:"msg_content"`
-	Keywords       string    `json:"keywords"`
-	CreatedAt      time.Time `json:"created_at"`
-}
-
-// LearnedKeywordWeights 返回已达到晋级阈值的正向候选词权重。
-// @param ctx：查询上下文。
-// @returns 关键词到10/20/30学习权重的映射或数据库错误。
-// ⚠️副作用说明：执行一次只读查询。
-func (r *postgresMonitorRepository) LearnedKeywordWeights(ctx context.Context) (map[string]float64, error) {
-	rows, err := r.pool.Query(ctx, `SELECT keyword,learned_weight FROM forbidden_monitor_risk_candidates WHERE learned_weight>0`)
-	// [决策理由] 查询失败时调用方必须保留旧引擎，不能发布不完整学习结果。
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make(map[string]float64)
-	for rows.Next() {
-		var keyword string
-		var weight float64
-		// [决策理由] 关键词与权重必须成对可信才能进入运行规则。
-		if err := rows.Scan(&keyword, &weight); err != nil {
-			return nil, err
-		}
-		result[keyword] = weight
-	}
-	// [决策理由] 迭代错误不能被当成完整空候选集。
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// >>> 数据演变示例
-	// 1. 免费count3/weight10 -> {免费:10}。
-	// 2. 候选均不足3次 -> {}。
-	return result, nil
 }
 
 // TryReserveLLMRequest 原子预占UTC日期内的一次模型请求额度。
@@ -176,267 +107,6 @@ func (r *postgresMonitorRepository) TryReserveLLMRequest(ctx context.Context, at
 	// 1. limit500且当前499 -> 递增500 -> true。
 	// 2. limit500且当前500 -> WHERE拒绝更新 -> false。
 	return true, nil
-}
-
-// TrainingSampleExists 按规范化原文哈希检查训练样本是否已存在。
-// @param ctx：查询上下文；message：已校验并去首尾空白的样本原文。
-// @returns 已存在为true，不存在为false，或数据库错误。
-// ⚠️副作用说明：执行一次只读PostgreSQL查询。
-func (r *postgresMonitorRepository) TrainingSampleExists(ctx context.Context, message string) (bool, error) {
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(message)))
-	var exists bool
-	err := r.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM forbidden_monitor_training_samples WHERE content_sha256=$1)`, hash).Scan(&exists)
-
-	// >>> 数据演变示例
-	// 1. 已投喂相同原文 -> hash命中 -> true。
-	// 2. 新原文 -> hash未命中 -> false。
-	return exists, err
-}
-
-// CreateTrainingSample 原子保存管理员确认的违规样本并晋级候选词。
-// @param ctx：事务上下文；actor：管理员身份；message：样本原文；features：模型提取且经原文校验的具体词。
-// @returns 新训练样本资源或冲突/数据库错误。
-// ⚠️副作用说明：写训练样本、逐词证据并更新候选确认次数和权重。
-func (r *postgresMonitorRepository) CreateTrainingSample(ctx context.Context, actor management.Actor, message string, features []string) (management.ResourceRecord, error) {
-	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 样本、候选证据和计数必须原子提交。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	defer tx.Rollback(ctx)
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(message)))
-	// [决策理由] 空特征样本仍是有效Few-shot正例，必须编码为JSON数组而不是null。
-	if features == nil {
-		features = []string{}
-	}
-	keywords, err := json.Marshal(features)
-	// [决策理由] 无法编码的特征不能与样本原文形成可信证据。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	var id int64
-	var createdAt time.Time
-	err = tx.QueryRow(ctx, `INSERT INTO forbidden_monitor_training_samples(content_sha256,msg_content,keywords,marked_by) VALUES($1,$2,$3,$4) ON CONFLICT(content_sha256) DO NOTHING RETURNING id,created_at`, hash, message, keywords, actor.ID).Scan(&id, &createdAt)
-	// [决策理由] 相同原文重复投喂不应重复放大候选权重，映射为资源冲突。
-	if errors.Is(err, pgx.ErrNoRows) {
-		return management.ResourceRecord{}, management.ErrResourceConflict
-	}
-	// [决策理由] 其他写入错误必须回滚全部候选变化。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	for _, keyword := range features {
-		// [决策理由] 候选主行必须先存在以满足训练证据外键。
-		if _, err := tx.Exec(ctx, `INSERT INTO forbidden_monitor_risk_candidates(keyword) VALUES($1) ON CONFLICT(keyword) DO NOTHING`, keyword); err != nil {
-			return management.ResourceRecord{}, err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO forbidden_monitor_candidate_training_evidence(keyword,training_sample_id) VALUES($1,$2)`, keyword, id); err != nil {
-			return management.ResourceRecord{}, err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE forbidden_monitor_risk_candidates SET confirmed_count=confirmed_count+1,learned_weight=CASE WHEN confirmed_count+1>=10 THEN 30 WHEN confirmed_count+1>=5 THEN 20 WHEN confirmed_count+1>=3 THEN 10 ELSE 0 END,last_confirmed_at=NOW(),version=version+1 WHERE keyword=$1`, keyword); err != nil {
-			return management.ResourceRecord{}, err
-		}
-	}
-	record, err := trainingSampleRecord(id, 1, message, features, createdAt)
-	// [决策理由] 样本创建必须与管理审计原子提交，避免存在无法追溯的生产学习证据。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	// [决策理由] 审计写入失败时必须回滚样本、证据和候选权重。
-	if err := insertTrainingSampleAudit(ctx, tx, actor, "plugin.resource.create", id, nil, &record); err != nil {
-		return management.ResourceRecord{}, err
-	}
-	// [决策理由] 只有完整候选更新成功后样本才能对Few-shot查询可见。
-	if err := tx.Commit(ctx); err != nil {
-		return management.ResourceRecord{}, err
-	}
-
-	// >>> 数据演变示例
-	// 1. 新样本含免费/扫码 -> 样本1+两条证据+各count增加。
-	// 2. 相同原文再次投喂 -> hash冲突 -> 不增加计数。
-	return record, nil
-}
-
-// ListTrainingSamples 分页读取WebUI投喂的违规正例。
-// @param ctx：查询上下文；query：已校验分页。
-// @returns 训练样本资源页或数据库错误。
-// ⚠️副作用说明：执行只读查询。
-func (r *postgresMonitorRepository) ListTrainingSamples(ctx context.Context, query management.ResourceQuery) (management.ResourcePage, error) {
-	var total int64
-	// [决策理由] 页面需要精确总数以生成分页。
-	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM forbidden_monitor_training_samples`).Scan(&total); err != nil {
-		return management.ResourcePage{}, err
-	}
-	rows, err := r.pool.Query(ctx, `SELECT id,msg_content,keywords,created_at,version FROM forbidden_monitor_training_samples ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2`, query.PageSize, (query.Page-1)*query.PageSize)
-	// [决策理由] 列表查询失败不能返回只有total的误导页面。
-	if err != nil {
-		return management.ResourcePage{}, err
-	}
-	defer rows.Close()
-	items := make([]management.ResourceRecord, 0)
-	for rows.Next() {
-		var id, version int64
-		var message string
-		var keywordsJSON json.RawMessage
-		var createdAt time.Time
-		// [决策理由] 样本原文、特征、版本和时间共同构成可管理快照。
-		if err := rows.Scan(&id, &message, &keywordsJSON, &createdAt, &version); err != nil {
-			return management.ResourcePage{}, err
-		}
-		var features []string
-		// [决策理由] 数据库存量特征必须保持字符串数组才能安全展示。
-		if err := json.Unmarshal(keywordsJSON, &features); err != nil {
-			return management.ResourcePage{}, err
-		}
-		record, err := trainingSampleRecord(id, version, message, features, createdAt)
-		// [决策理由] 单行无法编码时不得返回部分页。
-		if err != nil {
-			return management.ResourcePage{}, err
-		}
-		items = append(items, record)
-	}
-	// [决策理由] 迭代错误必须在页面消费前返回。
-	if err := rows.Err(); err != nil {
-		return management.ResourcePage{}, err
-	}
-	result := management.ResourcePage{Items: items, Page: query.Page, PageSize: query.PageSize, Total: total}
-
-	// >>> 数据演变示例
-	// 1. 3条样本+size2 -> items2,total3。
-	// 2. 空表 -> items[],total0。
-	return result, nil
-}
-
-// DeleteTrainingSample 按版本删除训练样本并回退候选权重。
-// @param ctx：事务上下文；actor：管理员身份；id/version：样本定位与乐观锁版本。
-// @returns 冲突、未找到或数据库错误。
-// ⚠️副作用说明：删除样本和训练证据，并递减候选确认次数与权重。
-func (r *postgresMonitorRepository) DeleteTrainingSample(ctx context.Context, actor management.Actor, id, version int64) error {
-	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 证据回退和样本删除必须原子。
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	var storedVersion int64
-	var message string
-	var keywordsJSON json.RawMessage
-	var createdAt time.Time
-	err = tx.QueryRow(ctx, `SELECT version,msg_content,keywords,created_at FROM forbidden_monitor_training_samples WHERE id=$1 FOR UPDATE`, id).Scan(&storedVersion, &message, &keywordsJSON, &createdAt)
-	// [决策理由] 不存在的资源与版本冲突语义不同，WebUI应能给出准确反馈。
-	if errors.Is(err, pgx.ErrNoRows) {
-		return management.ErrResourceRecordNotFound
-	}
-	// [决策理由] 锁定查询失败时不得触碰训练证据。
-	if err != nil {
-		return err
-	}
-	// [决策理由] 先校验锁定快照的版本，避免陈旧页面删除已变化的数据。
-	if storedVersion != version {
-		return management.ErrResourceConflict
-	}
-	var storedFeatures []string
-	// [决策理由] 删除审计和权重回退都依赖数据库中的可信特征快照。
-	if err := json.Unmarshal(keywordsJSON, &storedFeatures); err != nil {
-		return err
-	}
-	before, err := trainingSampleRecord(id, storedVersion, message, storedFeatures, createdAt)
-	// [决策理由] 无法构造完整前像时不得删除可影响生产学习的数据。
-	if err != nil {
-		return err
-	}
-	rows, err := tx.Query(ctx, `DELETE FROM forbidden_monitor_candidate_training_evidence WHERE training_sample_id=$1 RETURNING keyword`, id)
-	// [决策理由] 删除证据失败时不能继续删除样本。
-	if err != nil {
-		return err
-	}
-	keywords := make([]string, 0)
-	for rows.Next() {
-		var keyword string
-		// [决策理由] 每个删除证据都需要对应一次候选计数回退。
-		if err := rows.Scan(&keyword); err != nil {
-			rows.Close()
-			return err
-		}
-		keywords = append(keywords, keyword)
-	}
-	rows.Close()
-	// [决策理由] 游标错误不能提交部分回退。
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	command, err := tx.Exec(ctx, `DELETE FROM forbidden_monitor_training_samples WHERE id=$1`, id)
-	// [决策理由] SQL错误必须保持证据与样本原状。
-	if err != nil {
-		return err
-	}
-	// [决策理由] 持有行锁后仍未删除一行表示数据一致性异常，必须回滚。
-	if command.RowsAffected() != 1 {
-		return fmt.Errorf("删除训练样本%d时记录消失", id)
-	}
-	for _, keyword := range keywords {
-		if _, err := tx.Exec(ctx, `UPDATE forbidden_monitor_risk_candidates SET confirmed_count=GREATEST(confirmed_count-1,0),learned_weight=CASE WHEN GREATEST(confirmed_count-1,0)>=10 THEN 30 WHEN GREATEST(confirmed_count-1,0)>=5 THEN 20 WHEN GREATEST(confirmed_count-1,0)>=3 THEN 10 ELSE 0 END,version=version+1 WHERE keyword=$1`, keyword); err != nil {
-			return err
-		}
-	}
-	// [决策理由] 删除审计必须与样本和候选证据回退处于同一事务。
-	if err := insertTrainingSampleAudit(ctx, tx, actor, "plugin.resource.delete", id, &before, nil); err != nil {
-		return err
-	}
-	// [决策理由] 完整回退成功后才能对外确认删除。
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-
-	// >>> 数据演变示例
-	// 1. sample7含免费且count3 -> 删除 -> count2/weight0。
-	// 2. stale version -> 回滚证据删除 -> conflict。
-	return nil
-}
-
-// insertTrainingSampleAudit 写入训练样本管理操作的审计前后像。
-// @param ctx/tx：事务；actor：管理员；action/id：固定操作与样本ID；before/after：可选资源快照。
-// @returns JSON编码或SQL错误。
-// ⚠️副作用说明：向admin_audit_logs插入一行并随调用方事务提交。
-func insertTrainingSampleAudit(ctx context.Context, tx pgx.Tx, actor management.Actor, action string, id int64, before, after *management.ResourceRecord) error {
-	var beforeJSON, afterJSON any
-	// [决策理由] 创建操作没有前像，删除操作需要保存完整前像。
-	if before != nil {
-		beforeJSON = string(before.Data)
-	}
-	// [决策理由] 创建操作需要保存完整后像，删除操作没有后像。
-	if after != nil {
-		afterJSON = string(after.Data)
-	}
-	_, err := tx.Exec(ctx, `INSERT INTO admin_audit_logs(actor_id,actor_role,channel,action,target_type,target_id,before_json,after_json,success,request_id) VALUES($1,$2,$3,$4,'forbidden_monitor_training_sample',$5,$6::jsonb,$7::jsonb,TRUE,NULLIF($8,''))`, actor.ID, actor.Role, actor.Channel, action, fmt.Sprintf("%d", id), beforeJSON, afterJSON, actor.RequestID)
-
-	// >>> 数据演变示例
-	// 1. create+after -> before=NULL,after=样本快照。
-	// 2. delete+before -> before=样本快照,after=NULL。
-	return err
-}
-
-// trainingSampleRecord 编码训练样本为通用资源记录。
-// @param id/version：资源标识；message/features/createdAt：样本数据。
-// @returns 可供WebUI展示的记录或JSON错误。
-// ⚠️副作用说明：仅分配JSON内存。
-func trainingSampleRecord(id, version int64, message string, features []string, createdAt time.Time) (management.ResourceRecord, error) {
-	keywords, err := json.Marshal(features)
-	// [决策理由] 特征无法编码时不能返回损坏资源。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	data, err := json.Marshal(trainingSampleData{MessageContent: message, Keywords: string(keywords), CreatedAt: createdAt.UTC()})
-	// [决策理由] 通用资源要求完整JSON对象。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	result := management.ResourceRecord{ID: id, Version: version, Data: data}
-
-	// >>> 数据演变示例
-	// 1. id1+[免费] -> data.keywords="[\"免费\"]"。
-	// 2. 空features -> data.keywords="[]"。
-	return result, nil
 }
 
 type violationResourceHandler struct {
@@ -695,14 +365,14 @@ func (r *postgresMonitorRepository) GetViolation(ctx context.Context, id int64) 
 // TransitionByEvent 将群解禁或踢出事件关联到时间窗内最新违规记录。
 // @param ctx：事务上下文；actor：事件审计身份；groupID/userID：关联键；from/to：时间窗；targetStatus：目标状态。
 // @returns 是否匹配更新与错误。
-// ⚠️副作用说明：锁定记录，更新状态，误判时写反馈，并写管理审计。
+// ⚠️副作用说明：锁定记录、更新状态并写管理审计。
 func (r *postgresMonitorRepository) TransitionByEvent(ctx context.Context, actor management.Actor, groupID, userID int64, from, to time.Time, targetStatus string) (bool, error) {
 	// [决策理由] 群事件仅允许两个最终状态，防止内部调用越权跳转。
 	if targetStatus != statusFalsePositive && targetStatus != statusConfirmedKicked {
 		return false, management.ErrInvalidResourceData
 	}
 	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 状态、反馈和审计必须原子。
+	// [决策理由] 状态和审计必须原子。
 	if err != nil {
 		return false, err
 	}
@@ -717,24 +387,9 @@ func (r *postgresMonitorRepository) TransitionByEvent(ctx context.Context, actor
 		return false, err
 	}
 	after, err := updateViolationStatus(ctx, tx, stored, targetStatus, eventAllowedTransition)
-	// [决策理由] 已终结或不合法跳转不得写反馈。
+	// [决策理由] 已终结或不合法跳转不得写审计。
 	if err != nil {
 		return false, err
-	}
-	// [决策理由] 解禁误判必须在同一事务沉淀样本。
-	if targetStatus == statusFalsePositive {
-		if err := deactivatePositiveEvidence(ctx, tx, stored.ID); err != nil {
-			return false, err
-		}
-		if err := insertFeedback(ctx, tx, stored, "group_ban"); err != nil {
-			return false, err
-		}
-	}
-	// [决策理由] 管理员踢出是明确正向结论，证据必须与状态和审计原子沉淀。
-	if targetStatus == statusConfirmedKicked {
-		if err := insertPositiveEvidence(ctx, tx, stored, "group_decrease"); err != nil {
-			return false, err
-		}
 	}
 	// [决策理由] 事件自动状态变化也需可追溯。
 	if err := insertViolationAudit(ctx, tx, actor, stored, after); err != nil {
@@ -745,179 +400,9 @@ func (r *postgresMonitorRepository) TransitionByEvent(ctx context.Context, actor
 		return false, err
 	}
 	// >>> 数据演变示例
-	// 1. 解禁+最新pending -> false_positive+反馈+审计,true。
+	// 1. 解禁+最新pending -> false_positive+审计,true。
 	// 2. 时间窗无记录 -> false,nil。
 	return true, nil
-}
-
-// RecentExamples 读取指定群近期已形成结论的正反案例。
-// @param ctx：查询上下文；groupID：目标群；message：当前边界消息；limit：调用方限定的案例数量。
-// @returns 按结论时间倒序的有界案例或数据库错误。
-// ⚠️副作用说明：执行一次只读查询；消息原文仅供内部模型上下文使用。
-func (r *postgresMonitorRepository) RecentExamples(ctx context.Context, groupID int64, message string, limit int) ([]reviewExample, error) {
-	candidateLimit := limit * 8
-	// [决策理由] 候选池必须有界，同时至少覆盖请求数以便按相似度重排。
-	if candidateLimit < limit {
-		candidateLimit = limit
-	}
-	// [决策理由] 最多读取64条人工案例，限制数据库、内存和发送给模型前的处理成本。
-	if candidateLimit > 64 {
-		candidateLimit = 64
-	}
-	rows, err := r.pool.Query(ctx, `SELECT msg_content,is_violation,marked_at FROM (SELECT msg_content,status <> $2 AS is_violation,updated_at AS marked_at,id FROM forbidden_monitor_violation_audits WHERE group_id=$1 AND status IN ($2,$3,$4) UNION ALL SELECT msg_content,TRUE AS is_violation,created_at AS marked_at,id FROM forbidden_monitor_training_samples) AS examples ORDER BY marked_at DESC,id DESC LIMIT $5`, groupID, statusFalsePositive, statusConfirmedPendingKick, statusConfirmedKicked, candidateLimit)
-	// [决策理由] Few-shot案例查询失败时应由检测层降级，仓储不能返回部分不确定案例。
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make([]reviewExample, 0)
-	for rows.Next() {
-		var example reviewExample
-		// [决策理由] 文本、标签和结论时间共同构成可信案例，缺一不可。
-		if err := rows.Scan(&example.MessageContent, &example.IsViolation, &example.MarkedAt); err != nil {
-			return nil, err
-		}
-		result = append(result, example)
-	}
-	// [决策理由] 迭代错误必须在模型消费案例前报告。
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	target := normalizeSimilarity(message)
-	sort.SliceStable(result, func(left, right int) bool {
-		return similarity(target, normalizeSimilarity(result[left].MessageContent)) > similarity(target, normalizeSimilarity(result[right].MessageContent))
-	})
-	// [决策理由] 排序后只把最相似的有界案例交给模型。
-	if len(result) > limit {
-		result = result[:limit]
-	}
-	// >>> 数据演变示例
-	// 1. 已踢出A+误报B+投喂C -> [{A,true},{B,false},{C,true}]再按相似度排序。
-	// 2. 无已结论和训练样本 -> []。
-	return result, nil
-}
-
-// BehaviorSummary 聚合用户近期有效发言与违规行为。
-// @param ctx：查询上下文；groupID/userID：群与用户；since：包含边界窗口起点。
-// @returns 行为摘要或数据库错误。
-// ⚠️副作用说明：执行一次只读聚合查询。
-func (r *postgresMonitorRepository) BehaviorSummary(ctx context.Context, groupID, userID int64, since time.Time) (behaviorSummary, error) {
-	var result behaviorSummary
-	err := r.pool.QueryRow(ctx, `SELECT COALESCE((SELECT SUM(valid_count) FROM forbidden_monitor_daily_speech_counts WHERE group_id=$1 AND user_id=$2 AND speech_date >= $3),0),COALESCE((SELECT COUNT(*) FROM forbidden_monitor_violation_audits WHERE group_id=$1 AND user_id=$2 AND created_at >= $4),0),(SELECT MAX(message_time) FROM forbidden_monitor_violation_audits WHERE group_id=$1 AND user_id=$2)`, groupID, userID, since.UTC().Format(time.DateOnly), since).Scan(&result.ValidSpeechCount, &result.ViolationCount, &result.LastMessageTime)
-	// >>> 数据演变示例
-	// 1. 七日发言3+违规1 -> {3,1,lastTime}。
-	// 2. 新用户无记录 -> {0,0,nil}。
-	return result, err
-}
-
-// FeedbackKeywordCounts 聚合指定时间后误判样本的关键词频次。
-// @param ctx：查询上下文；since：误判标记时间起点。
-// @returns 关键词到样本出现次数的映射或数据库错误。
-// ⚠️副作用说明：展开反馈 JSON 数组并执行只读聚合查询。
-func (r *postgresMonitorRepository) FeedbackKeywordCounts(ctx context.Context, since time.Time) (map[string]int, error) {
-	rows, err := r.pool.Query(ctx, `SELECT keyword,COUNT(*)::BIGINT FROM forbidden_monitor_feedback_samples CROSS JOIN LATERAL jsonb_array_elements_text(keywords) AS keyword WHERE marked_at >= $1 GROUP BY keyword`, since)
-	// [决策理由] 查询失败不能生成不完整偏移补丁。
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make(map[string]int)
-	for rows.Next() {
-		var keyword string
-		var count int64
-		// [决策理由] 关键词与计数必须成对可信才可参与权重调整。
-		if err := rows.Scan(&keyword, &count); err != nil {
-			return nil, err
-		}
-		result[keyword] = int(count)
-	}
-	// [决策理由] 连接中断等迭代错误必须在返回完整聚合前检查。
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// >>> 数据演变示例
-	// 1. 两条误判均含"免费" -> {免费:2}。
-	// 2. 无误判或keywords为空 -> 空map。
-	return result, nil
-}
-
-// RefreshWeightOffsets 原子替换一个生效周期的负向权重偏移。
-// @param ctx：事务上下文；from/until：生效周期；offsets：检测层统计生成的偏移集合。
-// @returns 校验或事务错误。
-// ⚠️副作用说明：串行化同周期刷新，删除该周期旧偏移并写入新集合。
-func (r *postgresMonitorRepository) RefreshWeightOffsets(ctx context.Context, from, until time.Time, offsets []weightOffset) error {
-	fromDate := from.UTC().Truncate(24 * time.Hour)
-	untilDate := until.UTC().Truncate(24 * time.Hour)
-	// [决策理由] 数据库按DATE保存半开周期，必须用截断后的真实落库边界校验至少跨越一天。
-	if !untilDate.After(fromDate) {
-		return management.ErrInvalidResourceData
-	}
-	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 周期替换必须原子可见。
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	cycleDate := fromDate.Format(time.DateOnly)
-	// [决策理由] 同周期的并发定时任务必须串行，避免后提交任务覆盖期间交错写入。
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "forbidden_monitor_weight:"+cycleDate); err != nil {
-		return err
-	}
-	// [决策理由] 独立叠加补丁按周期完整重算，因此需先清除该周期旧结果。
-	if _, err := tx.Exec(ctx, `DELETE FROM forbidden_monitor_weight_offsets WHERE effective_from=$1`, cycleDate); err != nil {
-		return err
-	}
-	for _, offset := range offsets {
-		keyword := strings.TrimSpace(offset.Keyword)
-		// [决策理由] 数据库虽有约束，领域层仍应尽早拒绝非负偏移、空白词与零样本。
-		if keyword == "" || offset.WeightDelta >= 0 || offset.SampleCount < 1 {
-			return management.ErrInvalidResourceData
-		}
-		// [决策理由] 固定参数SQL避免关键词进入SQL结构。
-		if _, err := tx.Exec(ctx, `INSERT INTO forbidden_monitor_weight_offsets(keyword,weight_delta,sample_count,effective_from,effective_until) VALUES($1,$2,$3,$4,$5)`, keyword, offset.WeightDelta, offset.SampleCount, cycleDate, untilDate.Format(time.DateOnly)); err != nil {
-			return err
-		}
-	}
-	// [决策理由] 仅完整新集合可成为下一检测周期快照来源。
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	// >>> 数据演变示例
-	// 1. 周期旧[a:-1]+新[b:-2] -> 仅新周期[b:-2]。
-	// 2. 新[] -> 清空该周期补丁并提交。
-	return nil
-}
-
-// ActiveWeightOffsets 聚合指定日期正在生效的所有周期补丁。
-// @param ctx：查询上下文；at：检测发生时间。
-// @returns keyword到累积负向偏移的映射或数据库错误。
-// ⚠️副作用说明：执行一次只读聚合查询。
-func (r *postgresMonitorRepository) ActiveWeightOffsets(ctx context.Context, at time.Time) (map[string]float64, error) {
-	rows, err := r.pool.Query(ctx, `SELECT keyword,SUM(weight_delta)::DOUBLE PRECISION FROM forbidden_monitor_weight_offsets WHERE effective_from <= $1 AND effective_until > $1 GROUP BY keyword`, at.UTC().Format(time.DateOnly))
-	// [决策理由] 偏移读取失败不能返回部分权重导致同一消息判定不一致。
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make(map[string]float64)
-	for rows.Next() {
-		var keyword string
-		var delta float64
-		// [决策理由] 关键词与累积值必须成对扫描成功。
-		if err := rows.Scan(&keyword, &delta); err != nil {
-			return nil, err
-		}
-		result[keyword] = delta
-	}
-	// [决策理由] 聚合迭代错误必须在发布权重快照前检查。
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// >>> 数据演变示例
-	// 1. a在两周期-1与-0.5同时有效 -> {a:-1.5}。
-	// 2. 无有效周期 -> 空map。
-	return result, nil
 }
 
 // ListPending 分页读取待人工复核记录。
@@ -959,10 +444,10 @@ func (r *postgresMonitorRepository) ListPending(ctx context.Context, query manag
 // Review 使用乐观锁执行WebUI复核状态迁移。
 // @param ctx：事务上下文；actor：管理员；id/version：记录与期望版本；targetStatus：复核结果。
 // @returns 更新后资源记录或冲突/校验错误。
-// ⚠️副作用说明：更新审计状态，误报时写反馈，并写管理审计。
+// ⚠️副作用说明：更新审计状态并写管理审计。
 func (r *postgresMonitorRepository) Review(ctx context.Context, actor management.Actor, id, version int64, targetStatus string) (management.ResourceRecord, error) {
 	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 前像、状态、反馈与审计必须原子。
+	// [决策理由] 前像、状态与审计必须原子。
 	if err != nil {
 		return management.ResourceRecord{}, err
 	}
@@ -981,21 +466,6 @@ func (r *postgresMonitorRepository) Review(ctx context.Context, actor management
 	if err != nil {
 		return management.ResourceRecord{}, err
 	}
-	// [决策理由] WebUI误报样本与状态同事务生效。
-	if targetStatus == statusFalsePositive {
-		if err := deactivatePositiveEvidence(ctx, tx, stored.ID); err != nil {
-			return management.ResourceRecord{}, err
-		}
-		if err := insertFeedback(ctx, tx, stored, "webui"); err != nil {
-			return management.ResourceRecord{}, err
-		}
-	}
-	// [决策理由] 只有人工确认结论可晋级风险候选，模型自动判断不能自证学习。
-	if targetStatus == statusConfirmedPendingKick {
-		if err := insertPositiveEvidence(ctx, tx, stored, "webui"); err != nil {
-			return management.ResourceRecord{}, err
-		}
-	}
 	// [决策理由] 复核操作必须保存不可篡改的前后像。
 	if err := insertViolationAudit(ctx, tx, actor, stored, after); err != nil {
 		return management.ResourceRecord{}, err
@@ -1007,7 +477,7 @@ func (r *postgresMonitorRepository) Review(ctx context.Context, actor management
 	result, err := after.resourceRecord()
 	// >>> 数据演变示例
 	// 1. pending v1+确认 -> confirmed_pending_kick v2+审计。
-	// 2. pending v1+误报 -> false_positive v2+反馈+审计。
+	// 2. pending v1+误报 -> false_positive v2+审计。
 	return result, err
 }
 
@@ -1066,19 +536,19 @@ func (r *postgresMonitorRepository) BeginFalsePositive(ctx context.Context, id, 
 	return after, nil
 }
 
-// FinishFalsePositive 完成已解禁记录的误报终态、反馈与管理审计。
+// FinishFalsePositive 完成已解禁记录的误报终态与管理审计。
 // @param ctx：事务上下文；actor：管理员；id/version：处理中记录及版本。
 // @returns 误判终态资源；若解禁事件已抢先完成则返回当前终态资源。
-// ⚠️副作用说明：更新状态、写反馈样本和管理审计；全部在一个事务提交。
+// ⚠️副作用说明：更新状态并写管理审计；全部在一个事务提交。
 func (r *postgresMonitorRepository) FinishFalsePositive(ctx context.Context, actor management.Actor, id, version int64) (management.ResourceRecord, error) {
 	tx, err := r.pool.Begin(ctx)
-	// [决策理由] 终态、反馈和审计必须原子提交。
+	// [决策理由] 终态和审计必须原子提交。
 	if err != nil {
 		return management.ResourceRecord{}, err
 	}
 	defer tx.Rollback(ctx)
 	stored, err := getViolationForUpdate(ctx, tx, id)
-	// [决策理由] 记录读取失败不能生成孤立反馈。
+	// [决策理由] 记录读取失败不能生成无前像审计。
 	if err != nil {
 		return management.ResourceRecord{}, err
 	}
@@ -1093,16 +563,8 @@ func (r *postgresMonitorRepository) FinishFalsePositive(ctx context.Context, act
 	after, err := updateViolationStatus(ctx, tx, stored, statusFalsePositive, func(from, to string) bool {
 		return from == statusFalsePositivePending && to == statusFalsePositive
 	})
-	// [决策理由] 状态更新失败时不得写反馈与管理审计。
+	// [决策理由] 状态更新失败时不得写管理审计。
 	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	// [决策理由] 每条误报只沉淀一份反馈样本。
-	if err := insertFeedback(ctx, tx, stored, "webui"); err != nil {
-		return management.ResourceRecord{}, err
-	}
-	// [决策理由] 已确认后又解禁为误报时必须撤销正向证据，避免候选权重被污染。
-	if err := deactivatePositiveEvidence(ctx, tx, stored.ID); err != nil {
 		return management.ResourceRecord{}, err
 	}
 	// [决策理由] 管理员操作需保存不可变前后像。
@@ -1114,7 +576,7 @@ func (r *postgresMonitorRepository) FinishFalsePositive(ctx context.Context, act
 		return management.ResourceRecord{}, err
 	}
 	// >>> 数据演变示例
-	// 1. pending_unban v2+解禁成功 -> false_positive v3+反馈+审计。
+	// 1. pending_unban v2+解禁成功 -> false_positive v3+审计。
 	// 2. 解禁事件已写false_positive -> 直接返回当前记录。
 	return after.resourceRecord()
 }
@@ -1183,7 +645,7 @@ func (h *violationResourceHandler) Update(ctx context.Context, actor management.
 		if err := json.Unmarshal(current.Data.ActionResult, &outcome); err != nil {
 			return management.ResourceRecord{}, fmt.Errorf("解析违规处置结果: %w", err)
 		}
-		// [决策理由] Medium人工复核未执行禁言，误报只需原子沉淀反馈，不能发送多余解禁Action。
+		// [决策理由] 未自动禁言的待复核记录只需原子沉淀反馈，不能发送多余解禁Action。
 		if !outcome.BanSucceeded {
 			return h.repository.Review(ctx, actor, id, version, statusFalsePositive)
 		}
@@ -1430,157 +892,6 @@ func statusDisplayName(status string) string {
 	// 1. pending_review -> 待人工复核。
 	// 2. future_status -> future_status。
 	return result
-}
-
-// insertFeedback 写入与误判记录一对一的反馈样本。
-// @param ctx/tx：事务；stored：违规前像；source：标记来源。
-// @returns SQL错误。
-// ⚠️副作用说明：插入反馈样本，随调用方事务提交。
-func insertFeedback(ctx context.Context, tx pgx.Tx, stored storedViolation, source string) error {
-	keywords, err := feedbackFeatures(stored.Data.MessageContent, stored.Data.Violations)
-	// [决策理由] 原始证据损坏时不得写入无法解释的反馈样本。
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO forbidden_monitor_feedback_samples(violation_audit_id,msg_content,keywords,marked_source) VALUES($1,$2,$3,$4)`, stored.ID, stored.Data.MessageContent, keywords, source)
-	// >>> 数据演变示例
-	// 1. audit7+误报 -> feedback(audit7)。
-	// 2. audit7已有样本 -> 唯一约束错误并回滚。
-	return err
-}
-
-// insertPositiveEvidence 将人工确认的具体风险词幂等写入候选池并按次数晋级。
-// @param ctx/tx：事务；stored：确认记录前像；source：webui或group_decrease。
-// @returns 证据解析或SQL错误。
-// ⚠️副作用说明：插入逐审计候选证据并更新候选确认次数和学习权重。
-func insertPositiveEvidence(ctx context.Context, tx pgx.Tx, stored storedViolation, source string) error {
-	features, err := baseLearningFeatures(stored.Data.MessageContent, stored.Data.Violations)
-	// [决策理由] 不可信模型特征不得进入自动学习候选池。
-	if err != nil {
-		return err
-	}
-	for _, keyword := range features {
-		// [决策理由] 候选主行必须先存在，逐审计证据的外键才能保证引用完整。
-		if _, err := tx.Exec(ctx, `INSERT INTO forbidden_monitor_risk_candidates(keyword) VALUES($1) ON CONFLICT(keyword) DO NOTHING`, keyword); err != nil {
-			return err
-		}
-		command, err := tx.Exec(ctx, `INSERT INTO forbidden_monitor_candidate_evidence(keyword,violation_audit_id,marked_source) VALUES($1,$2,$3) ON CONFLICT(keyword,violation_audit_id) DO NOTHING`, keyword, stored.ID, source)
-		// [决策理由] SQL失败必须回滚整个审核事务，避免状态已确认但证据缺失。
-		if err != nil {
-			return err
-		}
-		// [决策理由] 同一审计重复到达时不得重复增加确认次数。
-		if command.RowsAffected() == 0 {
-			continue
-		}
-		_, err = tx.Exec(ctx, `UPDATE forbidden_monitor_risk_candidates SET confirmed_count=confirmed_count+1,learned_weight=CASE WHEN confirmed_count+1>=10 THEN 30 WHEN confirmed_count+1>=5 THEN 20 WHEN confirmed_count+1>=3 THEN 10 ELSE 0 END,last_confirmed_at=NOW(),version=version+1 WHERE keyword=$1`, keyword)
-		// [决策理由] 候选统计必须与新增证据在同一事务内一致。
-		if err != nil {
-			return err
-		}
-	}
-
-	// >>> 数据演变示例
-	// 1. 关键词第3次人工确认 -> evidence新增 -> count3/weight10。
-	// 2. 同audit重复确认 -> evidence冲突0行 -> count保持不变。
-	return nil
-}
-
-// deactivatePositiveEvidence 撤销后来被判定误报的正向候选证据。
-// @param ctx/tx：事务；auditID：转为误报的违规审计ID。
-// @returns SQL或扫描错误。
-// ⚠️副作用说明：停用该审计的候选证据并重新计算候选次数和权重。
-func deactivatePositiveEvidence(ctx context.Context, tx pgx.Tx, auditID int64) error {
-	rows, err := tx.Query(ctx, `UPDATE forbidden_monitor_candidate_evidence SET active=FALSE,updated_at=NOW(),version=version+1 WHERE violation_audit_id=$1 AND active=TRUE RETURNING keyword`, auditID)
-	// [决策理由] 无法读取被撤销的关键词时不能安全修正候选统计。
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	keywords := make([]string, 0)
-	for rows.Next() {
-		var keyword string
-		// [决策理由] 每个返回关键词都对应一次需要撤销的有效证据。
-		if err := rows.Scan(&keyword); err != nil {
-			return err
-		}
-		keywords = append(keywords, keyword)
-	}
-	// [决策理由] 游标错误不得提交部分候选回退。
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, keyword := range keywords {
-		_, err := tx.Exec(ctx, `UPDATE forbidden_monitor_risk_candidates SET confirmed_count=GREATEST(confirmed_count-1,0),learned_weight=CASE WHEN GREATEST(confirmed_count-1,0)>=10 THEN 30 WHEN GREATEST(confirmed_count-1,0)>=5 THEN 20 WHEN GREATEST(confirmed_count-1,0)>=3 THEN 10 ELSE 0 END,version=version+1 WHERE keyword=$1`, keyword)
-		// [决策理由] 任一候选回退失败必须回滚误报状态和全部证据变化。
-		if err != nil {
-			return err
-		}
-	}
-
-	// >>> 数据演变示例
-	// 1. count3的确认记录转误报 -> 证据inactive -> count2/weight0。
-	// 2. audit无正向证据 -> 更新0行 -> 候选保持不变。
-	return nil
-}
-
-// baseLearningFeatures 提取确实出现在原文中的有界单项风险词。
-// @param message：消息原文；rawViolations：检测证据JSON数组。
-// @returns 去重且最多32项的规范风险词或解析错误。
-// ⚠️副作用说明：无。
-func baseLearningFeatures(message string, rawViolations json.RawMessage) ([]string, error) {
-	var violations []string
-	// [决策理由] 自动学习只能消费严格字符串数组，拒绝任意模型结构。
-	if err := json.Unmarshal(rawViolations, &violations); err != nil {
-		return nil, err
-	}
-	normalizedMessage := strings.ToLower(message)
-	result := make([]string, 0, 32)
-	seen := make(map[string]struct{})
-	for _, violation := range violations {
-		feature := strings.ToLower(strings.TrimSpace(violation))
-		// [决策理由] 只接受长度有界且真实出现在原文的词，过滤模型标签、整段解释和结构ID。
-		if len([]rune(feature)) < 1 || len([]rune(feature)) > 200 || !strings.Contains(normalizedMessage, feature) {
-			continue
-		}
-		// [决策理由] 单条消息对同一特征只能贡献一次确认且总量受限。
-		if _, exists := seen[feature]; !exists && len(result) < 32 {
-			seen[feature] = struct{}{}
-			result = append(result, feature)
-		}
-	}
-
-	// >>> 数据演变示例
-	// 1. 原文含免费且violations=[免费,免费] -> [免费]。
-	// 2. violations=[身份伪装]但原文不含 -> []。
-	return result, nil
-}
-
-// feedbackFeatures 从已命中的风险词提取有界单词与二元组合特征。
-// @param message：误判原文；rawViolations：检测时保存的风险词数组。
-// @returns 去重且最多32项的JSON数组或证据解析错误。
-// ⚠️副作用说明：无；不会从文本发现新词，仅组合已有检测证据。
-func feedbackFeatures(message string, rawViolations json.RawMessage) (json.RawMessage, error) {
-	features, err := baseLearningFeatures(message, rawViolations)
-	// [决策理由] 基础证据解析失败时不能生成组合特征。
-	if err != nil {
-		return nil, err
-	}
-	baseCount := len(features)
-	for left := 0; left < baseCount; left++ {
-		for right := left + 1; right < baseCount; right++ {
-			combination := features[left] + "+" + features[right]
-			// [决策理由] 二元组合仅由同一误判中共同出现的已有风险词组成，并受总容量限制。
-			if len(features) < 32 {
-				features = append(features, combination)
-			}
-		}
-	}
-	result, err := json.Marshal(features)
-	// >>> 数据演变示例
-	// 1. 原文含免费/加群且violations同值 -> [免费,加群,免费+加群]。
-	// 2. violations仅含不在原文的模型标签 -> []。
-	return result, err
 }
 
 // insertViolationAudit 写入违规复核的管理审计前后像。

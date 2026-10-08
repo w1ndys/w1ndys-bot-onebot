@@ -4,11 +4,12 @@ package forbiddenmessagemonitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,33 +29,32 @@ const (
 	activeSpeechMinimum      = 2
 	maintenanceInterval      = 24 * time.Hour
 	maintenanceRetryInterval = time.Minute
+	maintenanceRunTimeout    = 5 * time.Second
 	eventMatchWindow         = 31 * 24 * time.Hour
-	maxLLMExamples           = 8
 	actionTimeout            = 15 * time.Second
 )
 
 type implementation struct {
-	lexicon       atomic.Pointer[Lexicon]
-	lexiconStore  lexiconLoader
-	configJSON    atomic.Pointer[json.RawMessage]
-	actions       plugin.ActionAPI
-	repository    monitorRepository
-	httpClient    *http.Client
-	snapshot      atomic.Pointer[runtimeSnapshot]
-	offsets       atomic.Pointer[map[string]float64]
-	negative      atomic.Pointer[map[string]struct{}]
-	publicationMu sync.Mutex
-	transitionMu  sync.Mutex
-	lifecycleMu   sync.Mutex
-	llmMu         sync.Mutex
-	llmActive     int
-	trialMu       sync.Mutex
-	trials        map[int64]trustedTextTrial
-	trialSequence int64
-	cancel        context.CancelFunc
-	done          chan struct{}
-	desiredOn     bool
-	now           func() time.Time
+	lexicon             atomic.Pointer[Lexicon]
+	lexiconStore        lexiconLoader
+	configJSON          atomic.Pointer[json.RawMessage]
+	actions             plugin.ActionAPI
+	runtimeGate         plugin.RuntimeGate
+	repository          monitorRepository
+	httpClient          *http.Client
+	snapshot            atomic.Pointer[runtimeSnapshot]
+	publicationMu       sync.Mutex
+	transitionMu        sync.Mutex
+	lifecycleMu         sync.Mutex
+	llmMu               sync.Mutex
+	llmActive           int
+	cancel              context.CancelFunc
+	done                chan struct{}
+	desiredOn           bool
+	maintenanceCursorMu sync.Mutex
+	maintenanceCursor   int64
+	maintenanceTimeout  time.Duration
+	now                 func() time.Time
 }
 
 type moderationOutcome struct {
@@ -73,8 +73,9 @@ func (p *implementation) handleMessage(ctx context.Context, message *ws.MessageE
 	if message == nil || message.PostType != "message" || message.MessageType != "group" || message.GroupID <= 0 || message.UserID <= 0 {
 		return nil
 	}
-	// [决策理由] 空白消息不包含可审计或可研判的文本。
-	if strings.TrimSpace(message.RawMessage) == "" {
+	cleaned := NormalizeDetectionText(message.RawMessage)
+	// [决策理由] 媒体段和噪音清理后没有有效文本时不存在可匹配或可发送给模型的内容。
+	if cleaned == "" {
 		return nil
 	}
 	now := eventTime(message.Time, p.now())
@@ -98,34 +99,21 @@ func (p *implementation) handleMessage(ctx context.Context, message *ws.MessageE
 	if snapshot == nil || snapshot.engine == nil {
 		return fmt.Errorf("违禁消息检测配置尚未初始化")
 	}
-	exact := snapshot.engine.CheckExactText(message.RawMessage)
-	score := snapshot.engine.Score(message.RawMessage)
-	// [决策理由] 管理员明确配置的硬词属于确定性证据，可直接处置。
-	if exact.Blocked {
-		return p.moderateAndRecord(ctx, message, now, "precise_rule", nil, strings.Join(exact.Reasons, ","), learnableExactFeatures(exact.Reasons))
-	}
-	// [决策理由] 高分消息无需承担大模型成本，直接按加权证据处置。
+	score := snapshot.engine.Score(cleaned)
+	// [决策理由] 达到管理员配置阈值的消息无需承担大模型成本，直接按加权证据处置。
 	if score.Band == RiskBandHigh {
 		riskScore := boundedScore(score.Score)
-		return p.moderateAndRecord(ctx, message, now, "weighted_score", &riskScore, "加权关键词评分达到高风险阈值", score.MatchedRisk)
+		return p.moderateAndRecord(ctx, message, now, "weighted_score", &riskScore, "违禁词累计权重达到直接处置阈值", score.MatchedTerms)
 	}
-	// [决策理由] 长度门槛只控制外部模型调用，必须位于硬词和本地高风险判断之后。
-	if messageBelowLLMMinimum(message.RawMessage, snapshot.minLLMMessageLength) {
+	// [决策理由] 零权重长消息也可能是尚未收录的新型违规；仅由清洗后有效文本长度决定是否送模型。
+	if messageBelowLLMMinimum(cleaned, snapshot.minLLMMessageLength) {
 		return nil
 	}
-	// [决策理由] 冷启动模式将所有未被本地高风险规则处理且达到长度门槛的消息送入模型。
-	if snapshot.detectionMode == detectionModeColdStart {
-		return p.handleLLMRisk(ctx, message, now, snapshot, score)
-	}
-	// [决策理由] 常规模式低分消息直接放行，保持稳定运行成本。
-	if score.Band == RiskBandLow {
-		return nil
-	}
-	return p.handleLLMRisk(ctx, message, now, snapshot, score)
+	return p.handleLLMRisk(ctx, message, cleaned, now, snapshot, score)
 
 	// >>> 数据演变示例
 	// 1. 白名单命中 -> 计数后直接nil，不运行规则。
-	// 2. 中分 -> 行为摘要+Few-shot+LLM；未配置或失败则仅登记人工复核。
+	// 2. 零分长文本 -> LLM；本地高分 -> 直接执行现有自动处置。
 }
 
 // messageBelowLLMMinimum 判断消息是否短于外部模型调用门槛。
@@ -133,7 +121,7 @@ func (p *implementation) handleMessage(ctx context.Context, message *ws.MessageE
 // @returns 去首尾空白后的字符数小于门槛时为true。
 // ⚠️副作用说明：无。
 func messageBelowLLMMinimum(message string, minimum int) bool {
-	result := len([]rune(strings.TrimSpace(message))) < minimum
+	result := len([]rune(message)) < minimum
 
 	// >>> 数据演变示例
 	// 1. minimum30+29个汉字 -> true，跳过LLM。
@@ -141,32 +129,17 @@ func messageBelowLLMMinimum(message string, minimum int) bool {
 	return result
 }
 
-// handleLLMRisk 对冷启动或边界消息执行大模型研判。
+// handleLLMRisk 对未达到本地处置阈值的长消息执行大模型研判。
 // @param ctx：事件上下文；message/now：消息与时间；snapshot：运行快照；score：本地评分证据。
 // @returns 模型、记录或自动处置错误。
 // ⚠️副作用说明：可能向外部模型发送消息内容，也可能写人工复核记录或执行处罚。
-func (p *implementation) handleLLMRisk(ctx context.Context, message *ws.MessageEvent, now time.Time, snapshot *runtimeSnapshot, score ScoreResult) error {
+func (p *implementation) handleLLMRisk(ctx context.Context, message *ws.MessageEvent, cleaned string, now time.Time, snapshot *runtimeSnapshot, score ScoreResult) error {
 	// [决策理由] 模型未启用时安全放行，避免技术配置故障被写成用户违规或触发处罚。
 	if snapshot.evaluator == nil {
 		projectlogger.Error("消息跳过大模型研判", "reason", "大模型未启用")
 		return nil
 	}
-	behavior, err := p.repository.BehaviorSummary(ctx, message.GroupID, message.UserID, speechWindowStart(now))
-	// [决策理由] 行为摘要不完整时不应提交缺失上下文的模型判断。
-	if err != nil {
-		projectlogger.Error("消息读取近期行为失败，已放行", "error", err)
-		return nil
-	}
-	examples, err := p.repository.RecentExamples(ctx, message.GroupID, message.RawMessage, maxLLMExamples)
-	// [决策理由] Few-shot读取失败时降级人工，避免模型在缺少动态反馈时过度处罚。
-	if err != nil {
-		projectlogger.Error("消息读取人工案例失败，已放行", "error", err)
-		return nil
-	}
-	request := LLMEvaluationRequest{Message: message.RawMessage, BehaviorSummary: formatBehaviorSummary(behavior), Examples: make([]LLMExample, 0, len(examples))}
-	for _, example := range examples {
-		request.Examples = append(request.Examples, LLMExample{Message: example.MessageContent, Violated: example.IsViolation})
-	}
+	request := LLMEvaluationRequest{Message: cleaned}
 	// [决策理由] 并发饱和时安全放行，避免模型迟滞占满事件worker并扩大群消息积压。
 	if !p.tryAcquireLLM(snapshot.llmMaxConcurrency) {
 		projectlogger.Error("大模型并发已满，消息已放行")
@@ -203,7 +176,7 @@ func (p *implementation) handleLLMRisk(ctx context.Context, message *ws.MessageE
 	return p.moderateAndRecord(ctx, message, now, "llm", &result.TotalScore, result.Reason, result.Violations)
 
 	// >>> 数据演变示例
-	// 1. 冷启动低分+模型Safe/pass -> nil放行。
+	// 1. 零分长文本+模型Safe/pass -> nil放行。
 	// 2. 任意本地分数+模型High/block -> 禁言+撤回+pending_review审计。
 }
 
@@ -241,20 +214,6 @@ func (p *implementation) releaseLLM() {
 	// >>> 数据演变示例
 	// 1. active2 -> release -> active1。
 	// 2. active0 -> release -> 保持0。
-}
-
-// recordManualReview 为模型不可用的中风险消息创建无自动处罚记录。
-// @param ctx/message/now：事件信息；score：本地证据；reason：降级原因。
-// @returns 审计持久化错误。
-// ⚠️副作用说明：写入待人工复核记录，不禁言或撤回。
-func (p *implementation) recordManualReview(ctx context.Context, message *ws.MessageEvent, now time.Time, score ScoreResult, reason string) error {
-	riskScore := boundedScore(score.Score)
-	result := p.createReviewRecord(ctx, message, now, "weighted_score", &riskScore, reason, score.MatchedRisk, moderationOutcome{})
-
-	// >>> 数据演变示例
-	// 1. 中分+LLM关闭 -> pending_review+零处置结果。
-	// 2. 数据库失败 -> 返回错误且不处罚用户。
-	return result
 }
 
 // moderateAndRecord 先预留审计，再执行禁言和历史撤回并写回动作结果。
@@ -421,7 +380,7 @@ func (p *implementation) handleNotice(ctx context.Context, notice *ws.NoticeEven
 	return nil
 }
 
-// OnEnable 启动每日白名单与反馈权重刷新。
+// OnEnable 加载词库并启动每日白名单刷新。
 // @param ctx：首次刷新上下文。
 // @returns nil；维护错误由后台记录并在下一周期重试。
 // ⚠️副作用说明：启动一个可取消的维护协程，后台访问数据库和NapCat。
@@ -513,19 +472,25 @@ func (p *implementation) maintenanceLoop(ctx context.Context, done chan struct{}
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			next := maintenanceInterval
 			// [决策理由] 启动阶段NapCat可能尚未连接，失败时保持服务可用并缩短重试等待。
-			if err := p.runMaintenance(ctx); err != nil {
+			err := p.runMaintenance(ctx)
+			if err != nil {
 				projectlogger.Error("违禁消息监控维护失败，将自动重试", "error", err)
-				next = maintenanceRetryInterval
 			}
-			timer.Reset(next)
+			timer.Reset(nextMaintenanceInterval(err))
 		}
 	}
 
 	// >>> 数据演变示例
 	// 1. 启动立即维护失败 -> 记录错误 -> 1分钟后重试。
 	// 2. 维护成功 -> 24小时后再运行；disable -> 关闭done退出。
+}
+
+func nextMaintenanceInterval(err error) time.Duration {
+	if err != nil {
+		return maintenanceRetryInterval
+	}
+	return maintenanceInterval
 }
 
 // finishMaintenance 收割退出代次并按最新启用意图恢复维护。
@@ -554,70 +519,76 @@ func (p *implementation) finishMaintenance(done chan struct{}) {
 	// 2. 停用超时desiredOn=true -> 清空旧代次 -> 启动新代次。
 }
 
-// runMaintenance 刷新所有已观察群白名单并生成下一日权重补丁。
+// runMaintenance 刷新所有已观察群的活跃成员白名单。
 // @param ctx：维护上下文。
-// @returns 首个数据库或OneBot错误。
-// ⚠️副作用说明：读取群成员/计数/反馈，替换白名单与权重偏移，并原子更新检测引擎。
+// @returns 全局门禁、群集合或各已启用群刷新错误的聚合结果。
+// ⚠️副作用说明：读取群成员与发言计数，并原子替换各群白名单。
 func (p *implementation) runMaintenance(ctx context.Context) error {
+	if p.runtimeGate == nil {
+		return errors.New("违禁消息监控维护缺少运行门禁")
+	}
+	admission, admitted := p.runtimeGate.Admit(pluginKey)
+	// [决策理由] worker 在 OnEnable 中启动时全局状态仍可能是 enabling；返回错误让维护循环短周期重试。
+	if !admitted || admission == nil {
+		return errors.New("违禁消息监控维护运行状态未就绪")
+	}
+	defer admission.Release()
+	maintenanceTimeout := p.maintenanceTimeout
+	if maintenanceTimeout <= 0 {
+		maintenanceTimeout = maintenanceRunTimeout
+	}
+	// [决策理由] RuntimeController 会先排空 admission 再调用 OnDisable，整轮独立截止时间避免数据库等待形成取消闭环。
+	maintenanceContext, cancel := context.WithTimeout(ctx, maintenanceTimeout)
+	defer cancel()
+
 	now := p.now().UTC()
-	groups, err := p.repository.ListObservedGroups(ctx)
+	groups, err := p.repository.ListObservedGroups(maintenanceContext)
 	// [决策理由] 群集合不完整时不能声称完成全量刷新。
 	if err != nil {
 		return fmt.Errorf("列出监控群: %w", err)
 	}
-	for _, groupID := range groups {
-		// [决策理由] 任一群刷新失败需保留错误，由下周期重试。
-		if err := p.refreshGroupWhitelist(ctx, groupID, now); err != nil {
-			return err
+	var maintenanceErr error
+	for _, groupID := range p.orderedMaintenanceGroups(groups) {
+		if err := maintenanceContext.Err(); err != nil {
+			return errors.Join(maintenanceErr, err)
 		}
+		// [决策理由] 历史业务数据不代表当前投放状态，每次群副作用前必须在同一 admission 内重查群门禁。
+		if !admission.GroupEnabled(groupID) {
+			p.advanceMaintenanceCursor(groupID)
+			continue
+		}
+		// [决策理由] 一个已退出或暂时不可用的群不得阻断其他已启用群刷新；聚合错误供短周期整体重试。
+		if err := p.refreshGroupWhitelist(maintenanceContext, groupID, now); err != nil {
+			maintenanceErr = errors.Join(maintenanceErr, err)
+		}
+		p.advanceMaintenanceCursor(groupID)
 	}
-	counts, err := p.repository.FeedbackKeywordCounts(ctx, now.AddDate(0, 0, -activeMemberDays))
-	// [决策理由] 不完整反馈统计不得覆盖当前周期补丁。
-	if err != nil {
-		return fmt.Errorf("统计误判关键词: %w", err)
-	}
-	offsets := make([]weightOffset, 0, len(counts))
-	for keyword, count := range counts {
-		delta := -math.Min(float64(count)*2, 20)
-		offsets = append(offsets, weightOffset{Keyword: keyword, WeightDelta: delta, SampleCount: count})
-	}
-	cycleStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	// [决策理由] 每日补丁只在下一周期前生效，持续误判会因七日统计提高当日偏移。
-	if err := p.repository.RefreshWeightOffsets(ctx, cycleStart, cycleStart.AddDate(0, 0, 1), offsets); err != nil {
-		return fmt.Errorf("刷新负向权重偏移: %w", err)
-	}
-	activeOffsets, err := p.repository.ActiveWeightOffsets(ctx, now)
-	// [决策理由] 读取失败时保留旧引擎，避免发布无反馈修正的部分状态。
-	if err != nil {
-		return fmt.Errorf("读取有效权重偏移: %w", err)
-	}
-	negativeFeatures := make(map[string]struct{}, len(activeOffsets))
-	for keyword := range activeOffsets {
-		negativeFeatures[strings.ToLower(strings.TrimSpace(keyword))] = struct{}{}
-	}
-	learnedWeights, err := p.repository.LearnedKeywordWeights(ctx)
-	// [决策理由] 正向学习读取失败时不能发布仅含负向反馈的部分规则快照。
-	if err != nil {
-		return fmt.Errorf("读取候选词学习权重: %w", err)
-	}
-	baseWeights := make(map[string]float64)
-	current := p.snapshot.Load()
-	// [决策理由] 只有基础配置可用时才能计算候选晋级相对已有权重的增量，避免重复累加。
-	if current == nil {
-		return fmt.Errorf("检测配置尚未初始化")
-	}
-	for _, rule := range current.engineConfig.WeightedKeywords {
-		baseWeights[strings.ToLower(strings.TrimSpace(rule.Text))] = rule.Weight
-	}
-	for keyword, weight := range learnedWeights {
-		key := strings.ToLower(strings.TrimSpace(keyword))
-		activeOffsets[key] += math.Max(0, weight-baseWeights[key])
-	}
-	return p.publishWeightOffsets(activeOffsets, negativeFeatures)
+	return maintenanceErr
 
 	// >>> 数据演变示例
-	// 1. 活跃成员满足7天+2次 -> 新白名单；误判词2次 -> 当日delta=-4。
-	// 2. 无群无反馈 -> 空集合刷新 -> 保持基础引擎。
+	// 1. 活跃成员满足7天+2次 -> 新白名单。
+	// 2. 群门禁关闭 -> 不访问NapCat或白名单；单群失败 -> 继续后续群并聚合错误。
+}
+
+// orderedMaintenanceGroups 从上轮最后尝试群的后继位置开始，避免固定截止时间长期饿死排序末尾群。
+func (p *implementation) orderedMaintenanceGroups(groups []int64) []int64 {
+	ordered := append([]int64(nil), groups...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	p.maintenanceCursorMu.Lock()
+	cursor := p.maintenanceCursor
+	p.maintenanceCursorMu.Unlock()
+	start := sort.Search(len(ordered), func(index int) bool { return ordered[index] > cursor })
+	if start == len(ordered) {
+		start = 0
+	}
+	return append(ordered[start:], ordered[:start]...)
+}
+
+// advanceMaintenanceCursor 在群刷新成功、失败或关闭跳过后推进下一轮起点。
+func (p *implementation) advanceMaintenanceCursor(groupID int64) {
+	p.maintenanceCursorMu.Lock()
+	p.maintenanceCursor = groupID
+	p.maintenanceCursorMu.Unlock()
 }
 
 // refreshGroupWhitelist 依据成员入群时间和七日发言数替换单群白名单。
@@ -657,102 +628,6 @@ func (p *implementation) refreshGroupWhitelist(ctx context.Context, groupID int6
 	return nil
 }
 
-// publishWeightOffsets 将反馈偏移叠加到基础配置并原子替换引擎。
-// @param offsets：关键词到负向偏移。
-// @returns 引擎配置错误。
-// ⚠️副作用说明：成功时替换运行快照中的检测引擎，保留LLM客户端与超时。
-func (p *implementation) publishWeightOffsets(offsets map[string]float64, negativeFeatures map[string]struct{}) error {
-	p.publicationMu.Lock()
-	defer p.publicationMu.Unlock()
-	current := p.snapshot.Load()
-	// [决策理由] 配置尚未发布时无法确定基础词库。
-	if current == nil {
-		return fmt.Errorf("检测配置尚未初始化")
-	}
-	next, storedOffsets, storedNegative, err := buildSnapshotWithWeightOffsets(current, offsets, negativeFeatures)
-	// [决策理由] 所有规则构造完成前不得改变任何运行时指针。
-	if err != nil {
-		return err
-	}
-	p.offsets.Store(&storedOffsets)
-	p.negative.Store(&storedNegative)
-	p.snapshot.Store(next)
-
-	// >>> 数据演变示例
-	// 1. 风险词免费25+delta-4 -> 新引擎weight21并原子发布。
-	// 2. 非法delta -> 构造失败 -> 三个旧指针保持不变。
-	return nil
-}
-
-// buildSnapshotWithWeightOffsets 基于指定基础快照离线构造反馈权重快照。
-// @param current：尚未发布的基础快照；offsets：词语权重偏移；negativeFeatures：已有误报证据的特征。
-// @returns 完整运行快照、规范化偏移、规范化误报特征或构造错误。
-// ⚠️副作用说明：仅分配内存和构造引擎，不修改插件的原子运行状态。
-func buildSnapshotWithWeightOffsets(current *runtimeSnapshot, offsets map[string]float64, negativeFeatures map[string]struct{}) (*runtimeSnapshot, map[string]float64, map[string]struct{}, error) {
-	storedOffsets := make(map[string]float64, len(offsets))
-	for keyword, delta := range offsets {
-		storedOffsets[strings.ToLower(strings.TrimSpace(keyword))] = delta
-	}
-	config := current.engineConfig
-	config.HardKeywords = append([]string(nil), config.HardKeywords...)
-	config.WeightedKeywords = append([]WeightedKeyword(nil), config.WeightedKeywords...)
-	config.SafeKeywords = append([]WeightedKeyword(nil), config.SafeKeywords...)
-	config.Combinations = append([]CombinationRule(nil), config.Combinations...)
-	filteredHard := config.HardKeywords[:0]
-	for _, keyword := range config.HardKeywords {
-		// [决策理由] 被人工确认误报的硬词不再执行零容错拦截，转由后续负向评分处理。
-		if _, exists := negativeFeatures[strings.ToLower(strings.TrimSpace(keyword))]; !exists {
-			filteredHard = append(filteredHard, keyword)
-		}
-	}
-	config.HardKeywords = filteredHard
-	used := make(map[string]struct{})
-	for index := range config.WeightedKeywords {
-		key := strings.ToLower(strings.TrimSpace(config.WeightedKeywords[index].Text))
-		// [决策理由] 仅命中已有风险词时降低其权重且不允许变为负数。
-		if delta, exists := storedOffsets[key]; exists {
-			config.WeightedKeywords[index].Weight = math.Max(0, config.WeightedKeywords[index].Weight+delta)
-			used[key] = struct{}{}
-		}
-	}
-	for feature, delta := range storedOffsets {
-		terms := strings.Split(feature, "+")
-		// [决策理由] 反馈二元组合必须作为负加成规则生效，不能把带加号的字面值误当安全词。
-		if len(terms) == 2 && terms[0] != "" && terms[1] != "" && delta < 0 {
-			config.Combinations = append(config.Combinations, CombinationRule{Terms: terms, Bonus: delta})
-			used[feature] = struct{}{}
-		}
-	}
-	for keyword, delta := range storedOffsets {
-		// [决策理由] 未命中风险词的误判特征作为安全抵扣词叠加，负偏移转换为正抵扣权重。
-		if _, exists := used[keyword]; !exists && delta < 0 {
-			config.SafeKeywords = append(config.SafeKeywords, WeightedKeyword{Text: keyword, Weight: -delta})
-			used[keyword] = struct{}{}
-		}
-	}
-	for keyword, delta := range storedOffsets {
-		// [决策理由] 晋级候选若不在基础词库中，应作为新风险词加入且只计算一次。
-		if _, exists := used[keyword]; !exists && delta > 0 {
-			config.WeightedKeywords = append(config.WeightedKeywords, WeightedKeyword{Text: keyword, Weight: delta})
-		}
-	}
-	engine, err := NewEngine(config)
-	// [决策理由] 新引擎完整构造成功前必须保留旧快照。
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("应用反馈权重: %w", err)
-	}
-	next := &runtimeSnapshot{engine: engine, engineConfig: current.engineConfig, evaluator: current.evaluator, llmTimeout: current.llmTimeout, detectionMode: current.detectionMode, llmMaxConcurrency: current.llmMaxConcurrency, llmDailyRequestLimit: current.llmDailyRequestLimit, minLLMMessageLength: current.minLLMMessageLength}
-	storedNegative := make(map[string]struct{}, len(negativeFeatures))
-	for keyword := range negativeFeatures {
-		storedNegative[strings.ToLower(strings.TrimSpace(keyword))] = struct{}{}
-	}
-
-	// >>> 数据演变示例
-	// 1. 风险词免费25+delta-4 -> 返回weight21的新快照。
-	// 2. 新特征校内群+delta-2 -> 返回含安全抵扣词2分的新快照。
-	return next, storedOffsets, storedNegative, nil
-}
-
 // newImplementation 使用运行时依赖创建监控实例和默认配置快照。
 // @param actions：受控 OneBot 能力；pool：业务数据与词库连接池。
 // @returns 可配置监控实例或依赖、配置错误。
@@ -772,7 +647,7 @@ func newImplementation(actions plugin.ActionAPI, pool *pgxpool.Pool) (*implement
 	if err != nil {
 		return nil, fmt.Errorf("初始化%s词库仓库: %w", pluginKey, err)
 	}
-	result := &implementation{actions: actions, repository: repository, lexiconStore: lexiconStore, httpClient: &http.Client{}, now: time.Now}
+	result := &implementation{actions: actions, repository: repository, lexiconStore: lexiconStore, httpClient: &http.Client{}, maintenanceTimeout: maintenanceRunTimeout, now: time.Now}
 	normalized, err := plugin.NormalizeConfig(result.ConfigSchema(), json.RawMessage(`{}`))
 	// [决策理由] 默认Schema无法规范化表示代码和平台配置契约已失配。
 	if err != nil {
@@ -830,42 +705,5 @@ func boundedScore(score float64) int {
 	// >>> 数据演变示例
 	// 1. 65.4 -> 65。
 	// 2. 120 -> 100。
-	return result
-}
-
-// learnableExactFeatures 提取可安全用于反馈权重的精准规则词。
-// @param reasons：精准层证据列表。
-// @returns 去除hard_keyword前缀后的硬词。
-// ⚠️副作用说明：无。
-func learnableExactFeatures(reasons []string) []string {
-	result := make([]string, 0)
-	for _, reason := range reasons {
-		// [决策理由] 只有具体硬词可被人工误报反馈精确降权。
-		if keyword, found := strings.CutPrefix(reason, "hard_keyword:"); found && keyword != "" {
-			result = append(result, keyword)
-		}
-	}
-
-	// >>> 数据演变示例
-	// 1. [hard_keyword:校内群] -> [校内群]。
-	// 2. [其他内部标识] -> []。
-	return result
-}
-
-// formatBehaviorSummary 生成不含额外身份数据的模型行为摘要。
-// @param summary：七日计数和近期违规聚合。
-// @returns 中文摘要文本。
-// ⚠️副作用说明：无。
-func formatBehaviorSummary(summary behaviorSummary) string {
-	last := "无"
-	// [决策理由] 没有历史违规时间时不得输出零值时间误导模型。
-	if summary.LastMessageTime != nil {
-		last = summary.LastMessageTime.UTC().Format(time.RFC3339)
-	}
-	result := fmt.Sprintf("最近7天有效发言%d次，近期违规记录%d条，最近违规时间%s", summary.ValidSpeechCount, summary.ViolationCount, last)
-
-	// >>> 数据演变示例
-	// 1. {3,1,time} -> 包含3次、1条与UTC时间。
-	// 2. {0,0,nil} -> 最近违规时间无。
 	return result
 }

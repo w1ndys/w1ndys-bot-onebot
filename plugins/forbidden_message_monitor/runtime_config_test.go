@@ -1,171 +1,130 @@
-// 📌 影响范围：启动本机HTTP测试服务验证大模型配置与协议；不访问真实供应商、QQ或数据库。
+// 📌 影响范围：使用内存 HTTP Transport 验证违禁监控配置与模型协议；不访问真实供应商、QQ 或数据库。
 package forbiddenmessagemonitor
 
 import (
 	"context"
 	"encoding/json"
-	"math"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/w1ndys/w1ndys-bot/internal/plugin"
 )
 
-// TestApplyConfigKeepsSnapshotWhenOffsetBuildFails 验证反馈补丁失败不会部分发布新配置。
-// @param t：测试上下文。
-// @returns 无。
-// ⚠️副作用说明：仅修改测试实例的内存原子指针。
-func TestApplyConfigKeepsSnapshotWhenOffsetBuildFails(t *testing.T) {
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func TestApplyConfigKeepsSnapshotWhenBuildFails(t *testing.T) {
 	instance := &implementation{httpClient: &http.Client{}}
 	oldConfig := DefaultEngineConfig()
 	oldEngine, err := NewEngine(oldConfig)
-	// [决策理由] 必须先建立可比较的旧运行快照。
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldSnapshot := &runtimeSnapshot{engine: oldEngine, engineConfig: oldConfig, minLLMMessageLength: 30}
 	instance.snapshot.Store(oldSnapshot)
-	offsets := map[string]float64{"异常偏移": math.Inf(1)}
-	instance.offsets.Store(&offsets)
-	raw, err := plugin.NormalizeConfig(instance.ConfigSchema(), json.RawMessage(`{"min_llm_message_length":40}`))
-	// [决策理由] 测试必须让基础配置合法，只由反馈偏移触发失败。
-	if err != nil {
-		t.Fatal(err)
+
+	raw := json.RawMessage(`{"violation_weight_threshold":1001,"llm_enabled":false,"llm_endpoint":"","llm_model":"","llm_api_key":"","llm_timeout_seconds":20,"llm_max_concurrency":2,"llm_daily_request_limit":500,"min_llm_message_length":40}`)
+	if err := instance.ApplyConfig(context.Background(), raw); err == nil {
+		t.Fatal("ApplyConfig() accepted an out-of-range violation threshold")
 	}
-	err = instance.ApplyConfig(context.Background(), raw)
-	// [决策理由] 非有限偏移必须使最终引擎构造失败。
-	if err == nil {
-		t.Fatal("ApplyConfig() accepted infinite offset")
-	}
-	// [决策理由] 热应用返回失败后消息处理必须继续读取完全相同的旧快照。
 	if got := instance.snapshot.Load(); got != oldSnapshot || got.minLLMMessageLength != 30 {
 		t.Fatalf("snapshot=%p old=%p minimum=%d", got, oldSnapshot, got.minLLMMessageLength)
 	}
-
-	// >>> 数据演变示例
-	// 1. old minimum30+new minimum40+Inf补丁 -> error -> 保持old minimum30。
-	// 2. 合法补丁+new minimum40 -> 其他测试覆盖一次发布最终快照。
 }
 
-// TestDefaultRuntimeConfigBuildsWithoutLLM 验证默认配置可运行且不创建外部调用器。
-// @param t：测试上下文。
-// @returns 无。
-// ⚠️副作用说明：仅构造内存引擎。
 func TestDefaultRuntimeConfigBuildsWithoutLLM(t *testing.T) {
 	instance := &implementation{httpClient: &http.Client{}}
 	raw, err := plugin.NormalizeConfig(instance.ConfigSchema(), json.RawMessage(`{}`))
-	// [决策理由] 默认Schema必须生成完整可应用配置。
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := buildRuntimeSnapshot(raw, Lexicon{}, instance.httpClient)
-	// [决策理由] 新安装默认关闭LLM仍应具备确定性检测引擎。
 	if err != nil || snapshot.engine == nil || snapshot.evaluator != nil {
 		t.Fatalf("buildRuntimeSnapshot() snapshot=%+v error=%v", snapshot, err)
 	}
-	// [决策理由] 新安装和历史配置都必须得到默认30字符的模型调用门槛。
-	if snapshot.minLLMMessageLength != 30 {
-		t.Fatalf("minLLMMessageLength=%d", snapshot.minLLMMessageLength)
+	if snapshot.minLLMMessageLength != 30 || snapshot.engineConfig.ViolationThreshold != 60 {
+		t.Fatalf("snapshot defaults = %+v", snapshot)
 	}
-
-	// >>> 数据演变示例
-	// 1. {} -> Schema默认值 -> engine+nil evaluator。
-	// 2. LLM关闭 -> 不要求endpoint/model/key。
 }
 
-// TestOpenAICompatibleEvaluatorUsesAuthAndStrictResult 验证鉴权头、请求和严格模型输出。
-// @param t：测试上下文。
-// @returns 无。
-// ⚠️副作用说明：启动本机HTTP服务并交换不含真实隐私的测试JSON。
-func TestOpenAICompatibleEvaluatorUsesAuthAndStrictResult(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		// [决策理由] API Key只能通过Bearer头传递，不能进入URL。
+func TestOpenAICompatibleEvaluatorSendsOnlyCleanedMessage(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.Header.Get("Authorization") != "Bearer secret" {
 			t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
 		}
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"choices":[{"message":{"content":"{\"risk_level\":\"High\",\"total_score\":90,\"reason\":\"引流\",\"violations\":[\"微信\"],\"suggested_action\":\"block\"}"}}]}`))
-	}))
-	defer server.Close()
-	evaluator := &openAICompatibleEvaluator{endpoint: server.URL, model: "test-model", apiKey: "secret", client: server.Client()}
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		} else if len(body.Messages) != 2 || body.Messages[1].Content != `{"message":"测试消息"}` {
+			t.Errorf("messages = %+v", body.Messages)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"{\"risk_level\":\"High\",\"total_score\":90,\"reason\":\"引流\",\"violations\":[\"微信\"],\"suggested_action\":\"block\"}"}}]}`)),
+		}, nil
+	})}
+	evaluator := &openAICompatibleEvaluator{endpoint: "https://llm.example/v1/chat/completions", model: "test-model", apiKey: "secret", client: client}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	result, err := evaluator.Evaluate(ctx, LLMEvaluationRequest{Message: "测试消息", BehaviorSummary: "新用户", Examples: []LLMExample{}})
-	// [决策理由] 合法兼容响应必须解码为可执行block结论。
+	result, err := evaluator.Evaluate(ctx, LLMEvaluationRequest{Message: "测试消息"})
 	if err != nil || result.SuggestedAction != "block" || result.TotalScore != 90 {
 		t.Fatalf("Evaluate() result=%+v error=%v", result, err)
 	}
-
-	// >>> 数据演变示例
-	// 1. Bearer secret+High/90/block -> 严格结果成功。
-	// 2. 模型输出未知字段 -> DecodeLLMEvaluationResult测试覆盖拒绝。
 }
 
-// TestRuntimeConfigRejectsInvalidLLMAndRuleJSON 验证外部端点与词库输入边界。
-// @param t：测试上下文。
-// @returns 无。
-// ⚠️副作用说明：无。
-func TestRuntimeConfigRejectsInvalidLLMAndRuleJSON(t *testing.T) {
-	base := pluginConfig{LowThreshold: 20, HighThreshold: 60, LLMTimeoutSeconds: 20}
+func TestRuntimeConfigRejectsInvalidLLMAndLexicon(t *testing.T) {
+	base := pluginConfig{
+		ViolationWeightThreshold: 60,
+		LLMTimeoutSeconds:        20,
+		LLMMaxConcurrency:        2,
+		LLMDailyRequestLimit:     500,
+		MinLLMMessageLength:      30,
+	}
 	raw, _ := json.Marshal(base)
-	// [决策理由] 词库来自业务表，非法权重必须由引擎校验拒绝，不能发布不可运行快照。
-	_, err := buildRuntimeSnapshot(raw, Lexicon{Risk: []WeightedKeyword{{Text: "x", Weight: -1}}}, &http.Client{})
-	if err == nil {
+	if _, err := buildRuntimeSnapshot(raw, Lexicon{Terms: []WeightedKeyword{{Text: "x", Weight: -1}}}, &http.Client{}); err == nil {
 		t.Fatal("negative weighted keyword accepted")
 	}
-	_, err = buildRuntimeSnapshot(raw, Lexicon{Combinations: []CombinationRule{{Terms: []string{""}, Bonus: 1}}}, &http.Client{})
-	if err == nil {
-		t.Fatal("empty combination term accepted")
-	}
+
 	base.LLMEnabled = true
 	base.LLMEndpoint = "file:///tmp/model"
 	base.LLMModel = "test"
 	raw, _ = json.Marshal(base)
-	_, err = buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{})
-	// [决策理由] 非HTTP协议不得成为消息外发目标。
-	if err == nil {
+	if _, err := buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{}); err == nil {
 		t.Fatal("file LLM endpoint accepted")
 	}
 	base.LLMEndpoint = "http://llm.example/v1/chat/completions"
 	raw, _ = json.Marshal(base)
-	_, err = buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{})
-	// [决策理由] 远程HTTP会明文泄露群消息和密钥，必须在配置阶段拒绝。
-	if err == nil {
+	if _, err := buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{}); err == nil {
 		t.Fatal("remote HTTP LLM endpoint accepted")
 	}
 	base.LLMEndpoint = "http://127.0.0.1:11434/v1/chat/completions"
 	raw, _ = json.Marshal(base)
-	_, err = buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{})
-	// [决策理由] 本机回环HTTP用于本地模型，且流量不离开主机，应允许配置。
-	if err != nil {
+	if _, err := buildRuntimeSnapshot(raw, Lexicon{}, &http.Client{}); err != nil {
 		t.Fatalf("loopback HTTP LLM endpoint rejected: %v", err)
 	}
-
-	// >>> 数据演变示例
-	// 1. 风险词含unknown -> DisallowUnknownFields -> error。
-	// 2. 远程HTTP -> 隐私边界校验 -> error；回环HTTP -> 允许。
 }
 
-// TestSecureLLMHTTPClientRejectsUnsafeRedirect 验证重定向不能绕过远程HTTPS边界。
-// @param t：测试上下文。
-// @returns 无。
-// ⚠️副作用说明：仅调用客户端重定向校验器，不发起网络请求。
 func TestSecureLLMHTTPClientRejectsUnsafeRedirect(t *testing.T) {
 	client := secureLLMHTTPClient(&http.Client{})
 	unsafeRequest, _ := http.NewRequest(http.MethodGet, "http://llm.example/v1/chat/completions", nil)
 	secureRequest, _ := http.NewRequest(http.MethodGet, "https://llm.example/v1/chat/completions", nil)
-	// [决策理由] HTTPS初始端点跳转到远程HTTP时必须在发送第二跳前拒绝。
 	if err := client.CheckRedirect(unsafeRequest, []*http.Request{secureRequest}); err == nil {
 		t.Fatal("unsafe remote HTTP redirect accepted")
 	}
 	loopbackRequest, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:11434/v1/chat/completions", nil)
-	// [决策理由] 本机模型在回环地址内重定向仍满足相同隐私边界。
 	if err := client.CheckRedirect(loopbackRequest, []*http.Request{loopbackRequest}); err != nil {
 		t.Fatalf("loopback redirect rejected: %v", err)
 	}
-	// >>> 数据演变示例
-	// 1. https://safe -> http://remote -> error且第二跳不发送。
-	// 2. http://127.0.0.1/a -> http://127.0.0.1/b -> nil。
 }

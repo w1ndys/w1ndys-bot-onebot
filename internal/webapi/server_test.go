@@ -543,6 +543,33 @@ func TestStrictJSONAndRequestIDSanitization(t *testing.T) {
 	// 2. 129字符Request-ID -> 服务端随机ID -> 审计字段安全。
 }
 
+// TestRemovedForbiddenMonitorRoutesAreNotRegistered 防止已废弃的训练样本和组合规则接口重新暴露。
+func TestRemovedForbiddenMonitorRoutesAreNotRegistered(t *testing.T) {
+	monitor := &fakeForbiddenMonitor{}
+	server, token := newMonitorTestServer(t, monitor)
+	targets := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodGet, path: "/api/plugins/forbidden_message_monitor/training-samples"},
+		{method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/training-samples", body: `{"msg_content":"广告","trial_id":"trial-1"}`},
+		{method: http.MethodDelete, path: "/api/plugins/forbidden_message_monitor/training-samples/1", body: `{"expected_version":1}`},
+		{method: http.MethodGet, path: "/api/plugins/forbidden_message_monitor/combinations"},
+		{method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/combinations", body: `{"terms":["加","微信"],"bonus":30}`},
+		{method: http.MethodDelete, path: "/api/plugins/forbidden_message_monitor/combinations/1", body: `{"expected_version":1}`},
+	}
+	for _, target := range targets {
+		recorder := requestAPI(server, token, target.method, target.path, target.body, "req-removed")
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status=%d body=%s", target.method, target.path, recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(monitor.calls) != 0 {
+		t.Fatalf("removed route reached service: %v", monitor.calls)
+	}
+}
+
 // requestLogin 使用固定测试远端地址执行登录请求。
 // @param server：测试服务；qq：登录QQ；password：登录密码。
 // @returns 已完成的登录响应记录器。

@@ -15,25 +15,26 @@ import (
 )
 
 type fakeForbiddenMonitor struct {
-	page        forbiddenmonitor.RecordPage
-	record      forbiddenmonitor.Record
-	term        forbiddenmonitor.Term
-	combination forbiddenmonitor.Combination
-	err         error
-	actor       management.Actor
-	id          int64
-	version     int64
-	status      string
-	text        string
-	trialID     string
-	kind        string
-	termInput   forbiddenmonitor.TermInput
-	comboInput  forbiddenmonitor.CombinationInput
-	calls       []string
+	page              forbiddenmonitor.RecordPage
+	record            forbiddenmonitor.Record
+	term              forbiddenmonitor.Term
+	err               error
+	actor             management.Actor
+	id                int64
+	version           int64
+	status            string
+	text              string
+	violationPage     int
+	violationPageSize int
+	termPage          int
+	termPageSize      int
+	termInput         forbiddenmonitor.TermInput
+	calls             []string
 }
 
-func (f *fakeForbiddenMonitor) ListViolations(_ context.Context, actor management.Actor, _, _ int) (forbiddenmonitor.RecordPage, error) {
-	f.actor, f.calls = actor, append(f.calls, "list-violations")
+func (f *fakeForbiddenMonitor) ListViolations(_ context.Context, actor management.Actor, page, pageSize int) (forbiddenmonitor.RecordPage, error) {
+	f.actor, f.violationPage, f.violationPageSize = actor, page, pageSize
+	f.calls = append(f.calls, "list-violations")
 	return f.page, f.err
 }
 
@@ -48,25 +49,9 @@ func (f *fakeForbiddenMonitor) RunTextTrial(_ context.Context, actor management.
 	return f.record, f.err
 }
 
-func (f *fakeForbiddenMonitor) ListTrainingSamples(_ context.Context, actor management.Actor, _, _ int) (forbiddenmonitor.RecordPage, error) {
-	f.actor, f.calls = actor, append(f.calls, "list-samples")
-	return f.page, f.err
-}
-
-func (f *fakeForbiddenMonitor) CreateTrainingSample(_ context.Context, actor management.Actor, text, trialID string) (forbiddenmonitor.Record, error) {
-	f.actor, f.text, f.trialID = actor, text, trialID
-	f.calls = append(f.calls, "create-sample")
-	return f.record, f.err
-}
-
-func (f *fakeForbiddenMonitor) DeleteTrainingSample(_ context.Context, actor management.Actor, id, version int64) error {
-	f.actor, f.id, f.version = actor, id, version
-	f.calls = append(f.calls, "delete-sample")
-	return f.err
-}
-
-func (f *fakeForbiddenMonitor) ListTerms(_ context.Context, actor management.Actor, kind string, _, _ int) ([]forbiddenmonitor.Term, int64, error) {
-	f.actor, f.kind, f.calls = actor, kind, append(f.calls, "list-terms")
+func (f *fakeForbiddenMonitor) ListTerms(_ context.Context, actor management.Actor, page, pageSize int) ([]forbiddenmonitor.Term, int64, error) {
+	f.actor, f.termPage, f.termPageSize = actor, page, pageSize
+	f.calls = append(f.calls, "list-terms")
 	return []forbiddenmonitor.Term{f.term}, 1, f.err
 }
 
@@ -87,22 +72,6 @@ func (f *fakeForbiddenMonitor) DeleteTerm(_ context.Context, actor management.Ac
 	return f.err
 }
 
-func (f *fakeForbiddenMonitor) ListCombinations(_ context.Context, actor management.Actor, _, _ int) ([]forbiddenmonitor.Combination, int64, error) {
-	f.actor, f.calls = actor, append(f.calls, "list-combinations")
-	return []forbiddenmonitor.Combination{f.combination}, 1, f.err
-}
-
-func (f *fakeForbiddenMonitor) CreateCombination(_ context.Context, actor management.Actor, input forbiddenmonitor.CombinationInput) (forbiddenmonitor.Combination, error) {
-	f.actor, f.comboInput, f.calls = actor, input, append(f.calls, "create-combination")
-	return f.combination, f.err
-}
-
-func (f *fakeForbiddenMonitor) DeleteCombination(_ context.Context, actor management.Actor, id, version int64) error {
-	f.actor, f.id, f.version = actor, id, version
-	f.calls = append(f.calls, "delete-combination")
-	return f.err
-}
-
 func newMonitorTestServer(t *testing.T, monitor *fakeForbiddenMonitor) (*Server, string) {
 	t.Helper()
 	admins := &fakeAdmins{accounts: map[string]admin.SystemAdmin{"100": {UserID: "100", Enabled: true}}}
@@ -120,15 +89,14 @@ func newMonitorTestServer(t *testing.T, monitor *fakeForbiddenMonitor) (*Server,
 
 func TestForbiddenMonitorRoutesReadAndWrite(t *testing.T) {
 	monitor := &fakeForbiddenMonitor{
-		page:        forbiddenmonitor.RecordPage{Items: []forbiddenmonitor.Record{{ID: 1, Version: 1, Data: json.RawMessage(`{"msg_content":"广告"}`)}}, Page: 1, PageSize: 20, Total: 1},
-		record:      forbiddenmonitor.Record{ID: 1, Version: 2, Data: json.RawMessage(`{"decision":"违规"}`)},
-		term:        forbiddenmonitor.Term{ID: 5, Kind: "risk", Text: "加微信", Weight: 25, Version: 1},
-		combination: forbiddenmonitor.Combination{ID: 7, Terms: []string{"加", "微信"}, Bonus: 30, Version: 1},
+		page:   forbiddenmonitor.RecordPage{Items: []forbiddenmonitor.Record{{ID: 1, Version: 1, Data: json.RawMessage(`{"msg_content":"广告"}`)}}, Page: 2, PageSize: 10, Total: 11},
+		record: forbiddenmonitor.Record{ID: 1, Version: 2, Data: json.RawMessage(`{"decision":"违规"}`)},
+		term:   forbiddenmonitor.Term{ID: 5, Text: "加微信", Weight: 25, Version: 2},
 	}
 	server, token := newMonitorTestServer(t, monitor)
 
-	if recorder := runtimeRequest(t, server, token, http.MethodGet, "/api/plugins/forbidden_message_monitor/violations", "", "req-1"); recorder.Code != http.StatusOK {
-		t.Fatalf("violations status = %d", recorder.Code)
+	if recorder := runtimeRequest(t, server, token, http.MethodGet, "/api/plugins/forbidden_message_monitor/violations?page=2&page_size=10", "", "req-1"); recorder.Code != http.StatusOK || monitor.violationPage != 2 || monitor.violationPageSize != 10 {
+		t.Fatalf("violations status=%d page=%d pageSize=%d", recorder.Code, monitor.violationPage, monitor.violationPageSize)
 	}
 	reviewRecorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/violations/1/review", `{"status":"确认","expected_version":1}`, "req-2")
 	if reviewRecorder.Code != http.StatusOK || monitor.id != 1 || monitor.version != 1 || monitor.status != "确认" {
@@ -140,23 +108,23 @@ func TestForbiddenMonitorRoutesReadAndWrite(t *testing.T) {
 		t.Fatalf("trial status=%d text=%q", trialRecorder.Code, monitor.text)
 	}
 
-	sampleRecorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/training-samples", `{"msg_content":"广告","trial_id":"t-1"}`, "req-4")
-	if sampleRecorder.Code != http.StatusOK || monitor.trialID != "t-1" {
-		t.Fatalf("sample status=%d trial=%q", sampleRecorder.Code, monitor.trialID)
+	listTermsRecorder := runtimeRequest(t, server, token, http.MethodGet, "/api/plugins/forbidden_message_monitor/terms?page=3&page_size=15", "", "req-4")
+	if listTermsRecorder.Code != http.StatusOK || monitor.termPage != 3 || monitor.termPageSize != 15 || !strings.Contains(listTermsRecorder.Body.String(), `"total":1`) {
+		t.Fatalf("terms status=%d page=%d pageSize=%d body=%s", listTermsRecorder.Code, monitor.termPage, monitor.termPageSize, listTermsRecorder.Body.String())
 	}
 
-	termRecorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/terms", `{"kind":"risk","text":"加微信","weight":25}`, "req-5")
-	if termRecorder.Code != http.StatusOK || monitor.termInput.Kind != "risk" || monitor.termInput.Weight != 25 {
+	termRecorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/terms", `{"text":"加微信","weight":25}`, "req-5")
+	if termRecorder.Code != http.StatusOK || monitor.termInput.Text != "加微信" || monitor.termInput.Weight != 25 {
 		t.Fatalf("term status=%d input=%+v", termRecorder.Code, monitor.termInput)
 	}
 
-	comboRecorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/combinations", `{"terms":["加","微信"],"bonus":30}`, "req-6")
-	if comboRecorder.Code != http.StatusOK || len(monitor.comboInput.Terms) != 2 || monitor.comboInput.Bonus != 30 {
-		t.Fatalf("combination status=%d input=%+v", comboRecorder.Code, monitor.comboInput)
+	updateRecorder := runtimeRequest(t, server, token, http.MethodPut, "/api/plugins/forbidden_message_monitor/terms/5", `{"text":"加好友","weight":30,"expected_version":1}`, "req-6")
+	if updateRecorder.Code != http.StatusOK || monitor.id != 5 || monitor.version != 1 || monitor.termInput.Text != "加好友" || monitor.termInput.Weight != 30 {
+		t.Fatalf("update status=%d fake=%+v", updateRecorder.Code, monitor)
 	}
 
-	deleteRecorder := runtimeRequest(t, server, token, http.MethodDelete, "/api/plugins/forbidden_message_monitor/terms/5", `{"expected_version":1}`, "req-7")
-	if deleteRecorder.Code != http.StatusOK || monitor.id != 5 || monitor.version != 1 {
+	deleteRecorder := runtimeRequest(t, server, token, http.MethodDelete, "/api/plugins/forbidden_message_monitor/terms/5", `{"expected_version":2}`, "req-7")
+	if deleteRecorder.Code != http.StatusOK || monitor.id != 5 || monitor.version != 2 {
 		t.Fatalf("delete status=%d fake=%+v", deleteRecorder.Code, monitor)
 	}
 	// 管理通道与请求 ID 必须由平台注入。
@@ -176,11 +144,12 @@ func TestForbiddenMonitorRoutesRejectInvalidInput(t *testing.T) {
 		{name: "复核缺少结论", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/violations/1/review", body: `{"expected_version":1}`},
 		{name: "复核 ID 非法", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/violations/0/review", body: `{"status":"确认","expected_version":1}`},
 		{name: "试判空文本", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/text-trials", body: `{"text":""}`},
-		{name: "样本缺少凭证", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/training-samples", body: `{"msg_content":"x"}`},
-		{name: "新增词条携带版本", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/terms", body: `{"kind":"risk","text":"x","weight":1,"expected_version":1}`},
-		{name: "更新词条缺少版本", method: http.MethodPut, path: "/api/plugins/forbidden_message_monitor/terms/1", body: `{"kind":"risk","text":"x","weight":1}`},
+		{name: "新增词条携带旧分类", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/terms", body: `{"kind":"risk","text":"x","weight":1}`},
+		{name: "更新词条携带旧分类", method: http.MethodPut, path: "/api/plugins/forbidden_message_monitor/terms/1", body: `{"kind":"risk","text":"x","weight":1,"expected_version":1}`},
+		{name: "新增词条携带版本", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/terms", body: `{"text":"x","weight":1,"expected_version":1}`},
+		{name: "新增词条携带零版本", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/terms", body: `{"text":"x","weight":1,"expected_version":0}`},
+		{name: "更新词条缺少版本", method: http.MethodPut, path: "/api/plugins/forbidden_message_monitor/terms/1", body: `{"text":"x","weight":1}`},
 		{name: "删除词条缺少版本", method: http.MethodDelete, path: "/api/plugins/forbidden_message_monitor/terms/1", body: `{}`},
-		{name: "组合缺少词项", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/combinations", body: `{"terms":[],"bonus":10}`},
 		{name: "未知字段", method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/text-trials", body: `{"text":"x","extra":1}`},
 	}
 	for _, test := range tests {
@@ -217,7 +186,7 @@ func TestForbiddenMonitorRoutesMapDomainErrors(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			monitor := &fakeForbiddenMonitor{err: test.err}
 			server, token := newMonitorTestServer(t, monitor)
-			recorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/terms", `{"kind":"risk","text":"x","weight":1}`, "req-error")
+			recorder := runtimeRequest(t, server, token, http.MethodPost, "/api/plugins/forbidden_message_monitor/terms", `{"text":"x","weight":1}`, "req-error")
 			if recorder.Code != test.want || !strings.Contains(recorder.Body.String(), test.code) {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
@@ -225,12 +194,27 @@ func TestForbiddenMonitorRoutesMapDomainErrors(t *testing.T) {
 	}
 }
 
+func TestForbiddenMonitorRoutesMapOptimisticLockConflict(t *testing.T) {
+	monitor := &fakeForbiddenMonitor{err: forbiddenmonitor.ErrLexiconConflict}
+	server, token := newMonitorTestServer(t, monitor)
+	recorder := runtimeRequest(t, server, token, http.MethodPut, "/api/plugins/forbidden_message_monitor/terms/5", `{"text":"加好友","weight":30,"expected_version":7}`, "req-conflict")
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"code":"forbidden_monitor_conflict"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if monitor.id != 5 || monitor.version != 7 || len(monitor.calls) != 1 || monitor.calls[0] != "update-term" {
+		t.Fatalf("fake=%+v", monitor)
+	}
+}
+
 func TestForbiddenMonitorRoutesRejectInvalidPagination(t *testing.T) {
 	for _, target := range []string{
 		"/api/plugins/forbidden_message_monitor/violations?page=0",
-		"/api/plugins/forbidden_message_monitor/training-samples?page_size=201",
+		"/api/plugins/forbidden_message_monitor/violations?kind=risk",
+		"/api/plugins/forbidden_message_monitor/violations?page=1&page=2",
 		"/api/plugins/forbidden_message_monitor/terms?page=abc",
-		"/api/plugins/forbidden_message_monitor/combinations?page_size=-1",
+		"/api/plugins/forbidden_message_monitor/terms?kind=hard",
+		"/api/plugins/forbidden_message_monitor/terms?page=",
+		"/api/plugins/forbidden_message_monitor/terms?page_size=201",
 	} {
 		monitor := &fakeForbiddenMonitor{}
 		server, token := newMonitorTestServer(t, monitor)
@@ -252,7 +236,8 @@ func TestForbiddenMonitorRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/text-trials"},
 		{method: http.MethodGet, path: "/api/plugins/forbidden_message_monitor/terms"},
 		{method: http.MethodPost, path: "/api/plugins/forbidden_message_monitor/terms"},
-		{method: http.MethodDelete, path: "/api/plugins/forbidden_message_monitor/combinations/1"},
+		{method: http.MethodPut, path: "/api/plugins/forbidden_message_monitor/terms/1"},
+		{method: http.MethodDelete, path: "/api/plugins/forbidden_message_monitor/terms/1"},
 	}
 	for _, target := range targets {
 		recorder := runtimeRequest(t, server, "", target.method, target.path, `{"expected_version":1}`, "req-anon")

@@ -126,6 +126,37 @@ func TestObserverDispatcherRoutesOnlyDeclaredKinds(t *testing.T) {
 	}
 }
 
+func TestObserverDispatcherRoutesOnlyDeclaredPhase(t *testing.T) {
+	var calls []string
+	before := observerTestSpec("before", []ObserverEventKind{ObserverGroupMessage}, func(ObserverContext) error {
+		calls = append(calls, "before")
+		return nil
+	})
+	before.Observers[0].Phase = ObserverPhaseBeforeCommands
+	after := observerTestSpec("after", []ObserverEventKind{ObserverGroupMessage}, func(ObserverContext) error {
+		calls = append(calls, "after")
+		return nil
+	})
+	dispatcher, controller := newObserverTestSubject(t, before, after)
+	for _, key := range []string{"before", "after"} {
+		if err := controller.SetGroupEnabled(key, 100, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := controller.Enable(context.Background(), key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	event := &ws.MessageEvent{MessageType: "group", GroupID: 100}
+	handled, err := dispatcher.DispatchPhase(context.Background(), event, ObserverPhaseBeforeCommands)
+	if handled != 1 || err != nil || len(calls) != 1 || calls[0] != "before" {
+		t.Fatalf("before DispatchPhase() = %d,%v calls=%v", handled, err, calls)
+	}
+	handled, err = dispatcher.Dispatch(context.Background(), event)
+	if handled != 1 || err != nil || len(calls) != 2 || calls[1] != "after" {
+		t.Fatalf("default Dispatch() = %d,%v calls=%v", handled, err, calls)
+	}
+}
+
 func TestObserverDispatcherReleasesAdmissionOnErrorAndPanic(t *testing.T) {
 	handlerErr := errors.New("observer failed")
 	t.Run("error", func(t *testing.T) {

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -23,7 +22,7 @@ const (
 	pluginKey    = "forbidden_message_monitor"
 	adminPageKey = "forbidden_message_monitor"
 	observerKey  = "moderation"
-	observerDesc = "对通过群门禁的群消息与群通知执行分层检测、自动处置与误判回收"
+	observerDesc = "对通过群门禁的群消息与群通知执行加权检测、模型审核、自动处置与复核同步"
 )
 
 // ErrInvalidInput 表示管理输入未通过领域校验。
@@ -84,6 +83,7 @@ func (s *Service) Spec() plugin.PluginSpec {
 		Observers: []plugin.ObserverSpec{{
 			Key:         observerKey,
 			Description: observerDesc,
+			Phase:       plugin.ObserverPhaseBeforeCommands,
 			EventKinds:  []plugin.ObserverEventKind{plugin.ObserverGroupMessage, plugin.ObserverGroupNotice},
 			Handler:     s.observe,
 		}},
@@ -102,6 +102,7 @@ func (s *Service) BindRuntimeController(controller *plugin.RuntimeController) er
 		return errors.New("违禁消息监控缺少运行控制器")
 	}
 	s.runtime = controller
+	s.implementation.runtimeGate = controller
 	return nil
 }
 
@@ -198,44 +199,6 @@ func (s *Service) runtimeAdmission(groupID int64) (plugin.Admission, bool) {
 	return admission, true
 }
 
-// ListTrainingSamples 分页读取管理员主动投喂的违规正例。
-func (s *Service) ListTrainingSamples(ctx context.Context, actor management.Actor, page, pageSize int) (RecordPage, error) {
-	if err := s.authorize(actor, page, pageSize); err != nil {
-		return RecordPage{}, err
-	}
-	result, err := s.implementation.repository.ListTrainingSamples(ctx, management.ResourceQuery{Page: page, PageSize: pageSize})
-	if err != nil {
-		return RecordPage{}, err
-	}
-	return toRecordPage(result), nil
-}
-
-// CreateTrainingSample 按试判凭证投喂违规正例；凭证由服务端在试判时签发。
-func (s *Service) CreateTrainingSample(ctx context.Context, actor management.Actor, text, trialID string) (Record, error) {
-	if err := s.authorizer.Authorize(actor); err != nil {
-		return Record{}, err
-	}
-	payload, err := json.Marshal(map[string]string{"msg_content": text, "trial_id": trialID})
-	if err != nil {
-		return Record{}, fmt.Errorf("%w: 无法编码训练样本", ErrInvalidInput)
-	}
-	handler := &trainingSampleResourceHandler{owner: s.implementation}
-	record, err := handler.Create(ctx, actor, payload)
-	if err != nil {
-		return Record{}, err
-	}
-	return Record{ID: record.ID, Version: record.Version, Data: record.Data}, nil
-}
-
-// DeleteTrainingSample 按乐观锁删除训练样本并回退候选词统计。
-func (s *Service) DeleteTrainingSample(ctx context.Context, actor management.Actor, id, expectedVersion int64) error {
-	if err := s.authorizer.Authorize(actor); err != nil {
-		return err
-	}
-	handler := &trainingSampleResourceHandler{owner: s.implementation}
-	return handler.Delete(ctx, actor, id, expectedVersion)
-}
-
 func (s *Service) authorize(actor management.Actor, page, pageSize int) error {
 	if err := s.authorizer.Authorize(actor); err != nil {
 		return err
@@ -257,15 +220,12 @@ func toRecordPage(page management.ResourcePage) RecordPage {
 	return RecordPage{Items: items, Page: page.Page, PageSize: page.PageSize, Total: page.Total}
 }
 
-// ListTerms 按分类分页读取词库词条；kind 为空表示全部分类。
-func (s *Service) ListTerms(ctx context.Context, actor management.Actor, kind string, page, pageSize int) ([]Term, int64, error) {
+// ListTerms 分页读取加权违禁词。
+func (s *Service) ListTerms(ctx context.Context, actor management.Actor, page, pageSize int) ([]Term, int64, error) {
 	if err := s.authorize(actor, page, pageSize); err != nil {
 		return nil, 0, err
 	}
-	if kind != "" && !validTermKind(kind) {
-		return nil, 0, fmt.Errorf("%w: 未知词条分类 %q", ErrInvalidInput, kind)
-	}
-	return s.lexicon.ListTerms(ctx, kind, page, pageSize)
+	return s.lexicon.ListTerms(ctx, page, pageSize)
 }
 
 // CreateTerm 新增词条并按新词库重建检测引擎。
@@ -317,94 +277,19 @@ func (s *Service) DeleteTerm(ctx context.Context, actor management.Actor, id, ex
 	return s.refreshLexicon(ctx)
 }
 
-// ListCombinations 分页读取组合加成规则。
-func (s *Service) ListCombinations(ctx context.Context, actor management.Actor, page, pageSize int) ([]Combination, int64, error) {
-	if err := s.authorize(actor, page, pageSize); err != nil {
-		return nil, 0, err
-	}
-	return s.lexicon.ListCombinations(ctx, page, pageSize)
-}
-
-// CreateCombination 新增组合规则并按新词库重建检测引擎。
-func (s *Service) CreateCombination(ctx context.Context, actor management.Actor, input CombinationInput) (Combination, error) {
-	s.lexiconMu.Lock()
-	defer s.lexiconMu.Unlock()
-	if err := s.authorizer.Authorize(actor); err != nil {
-		return Combination{}, err
-	}
-	normalized, err := normalizeCombination(input)
-	if err != nil {
-		return Combination{}, err
-	}
-	combination, err := s.lexicon.CreateCombination(ctx, actor, normalized)
-	if err != nil {
-		return Combination{}, err
-	}
-	return combination, s.refreshLexicon(ctx)
-}
-
-// DeleteCombination 按乐观锁删除组合规则并按新词库重建检测引擎。
-func (s *Service) DeleteCombination(ctx context.Context, actor management.Actor, id, expectedVersion int64) error {
-	s.lexiconMu.Lock()
-	defer s.lexiconMu.Unlock()
-	if err := s.authorizer.Authorize(actor); err != nil {
-		return err
-	}
-	if id < 1 || expectedVersion < 1 {
-		return fmt.Errorf("%w: 组合 ID 与版本必须为正数", ErrInvalidInput)
-	}
-	if err := s.lexicon.DeleteCombination(ctx, actor, id, expectedVersion); err != nil {
-		return err
-	}
-	return s.refreshLexicon(ctx)
-}
-
 // prepareTerm 校验管理身份并规范化词条输入。
 func (s *Service) prepareTerm(actor management.Actor, input TermInput) (TermInput, error) {
 	if err := s.authorizer.Authorize(actor); err != nil {
 		return TermInput{}, err
 	}
-	if !validTermKind(input.Kind) {
-		return TermInput{}, fmt.Errorf("%w: 未知词条分类 %q", ErrInvalidInput, input.Kind)
-	}
-	text := strings.TrimSpace(input.Text)
+	text := NormalizeDetectionText(input.Text)
 	if text == "" || utf8.RuneCountInString(text) > maxTermRunes {
-		return TermInput{}, fmt.Errorf("%w: 词条长度必须在 1 至 %d 之间", ErrInvalidInput, maxTermRunes)
+		return TermInput{}, fmt.Errorf("%w: 清洗后词条长度必须在 1 至 %d 之间", ErrInvalidInput, maxTermRunes)
 	}
-	// 硬性关键词是零误报直接拦截，不参与加权评分，权重必须归零避免误解。
-	weight := input.Weight
-	if input.Kind == TermKindHard {
-		weight = 0
+	if math.IsNaN(input.Weight) || math.IsInf(input.Weight, 0) || input.Weight <= 0 || input.Weight > maxTermWeight {
+		return TermInput{}, fmt.Errorf("%w: 权重必须在 1 至 %d 之间", ErrInvalidInput, maxTermWeight)
 	}
-	if math.IsNaN(weight) || math.IsInf(weight, 0) || weight < 0 || weight > maxTermWeight {
-		return TermInput{}, fmt.Errorf("%w: 权重必须在 0 至 %d 之间", ErrInvalidInput, maxTermWeight)
-	}
-	return TermInput{Kind: input.Kind, Text: text, Weight: weight}, nil
-}
-
-// normalizeCombination 校验并去重组合规则的词项。
-func normalizeCombination(input CombinationInput) (CombinationInput, error) {
-	if math.IsNaN(input.Bonus) || math.IsInf(input.Bonus, 0) || input.Bonus < 0 || input.Bonus > maxTermWeight {
-		return CombinationInput{}, fmt.Errorf("%w: 组合加分必须在 0 至 %d 之间", ErrInvalidInput, maxTermWeight)
-	}
-	seen := make(map[string]struct{}, len(input.Terms))
-	terms := make([]string, 0, len(input.Terms))
-	for _, term := range input.Terms {
-		trimmed := strings.TrimSpace(term)
-		// 空词项会让组合无条件命中，必须拒绝而不是静默丢弃。
-		if trimmed == "" || utf8.RuneCountInString(trimmed) > maxTermRunes {
-			return CombinationInput{}, fmt.Errorf("%w: 组合词项长度必须在 1 至 %d 之间", ErrInvalidInput, maxTermRunes)
-		}
-		if _, duplicate := seen[trimmed]; duplicate {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		terms = append(terms, trimmed)
-	}
-	if len(terms) < 2 || len(terms) > maxCombinationSize {
-		return CombinationInput{}, fmt.Errorf("%w: 组合必须包含 2 至 %d 个不同词项", ErrInvalidInput, maxCombinationSize)
-	}
-	return CombinationInput{Terms: terms, Bonus: input.Bonus}, nil
+	return TermInput{Text: text, Weight: input.Weight}, nil
 }
 
 // refreshLexicon 词库写入成功后按数据库权威结果重建检测引擎。
@@ -422,8 +307,4 @@ func (s *Service) refreshLexicon(ctx context.Context) error {
 		return refreshErr
 	}
 	return nil
-}
-
-func validTermKind(kind string) bool {
-	return kind == TermKindHard || kind == TermKindRisk || kind == TermKindSafe
 }

@@ -3,5 +3,5 @@ package forbiddenmessagemonitor
 
 const (
 	pluginDisplayName = "群内违禁消息监控"
-	pluginDescription = "按群监控广告与引流消息，支持分层检测、自动处置、人工复核、反馈学习和文本试判"
+	pluginDescription = "按群监控广告与引流消息，支持加权词检测、长文本大模型审核、自动处置、人工复核和文本试判"
 )

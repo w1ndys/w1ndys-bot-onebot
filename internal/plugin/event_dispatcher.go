@@ -13,7 +13,7 @@ type DispatchResult struct {
 	ObserversHandled int
 }
 
-// EventDispatcher 编排命令优先、未匹配事件观察的唯一内存入口。
+// EventDispatcher 编排命令前观察、命令匹配和未匹配事件观察的唯一内存入口。
 type EventDispatcher struct {
 	commands  *Dispatcher
 	observers *ObserverDispatcher
@@ -30,14 +30,34 @@ func NewEventDispatcher(commands *Dispatcher, observers *ObserverDispatcher) (*E
 	return &EventDispatcher{commands: commands, observers: observers}, nil
 }
 
-// Dispatch 优先执行群命令，仅将未匹配事件交给观察器。
+// Dispatch 先执行命令前观察器，再匹配群命令，并将未匹配事件交给默认观察器。
 func (d *EventDispatcher) Dispatch(ctx context.Context, event ws.Event) (DispatchResult, error) {
+	beforeHandled, err := d.DispatchBeforeCommands(ctx, event)
+	result := DispatchResult{ObserversHandled: beforeHandled}
+	if err != nil {
+		return result, err
+	}
+	afterResult, err := d.DispatchAfterBeforeCommands(ctx, event)
+	afterResult.ObserversHandled += beforeHandled
+	return afterResult, err
+}
+
+// DispatchBeforeCommands 只执行命令前观察器，供更高层命令入口复用安全检查。
+func (d *EventDispatcher) DispatchBeforeCommands(ctx context.Context, event ws.Event) (int, error) {
+	return d.observers.DispatchPhase(ctx, event, ObserverPhaseBeforeCommands)
+}
+
+// DispatchAfterBeforeCommands 在调用方已完成命令前观察后继续命令和默认观察器链。
+func (d *EventDispatcher) DispatchAfterBeforeCommands(ctx context.Context, event ws.Event) (DispatchResult, error) {
+	result := DispatchResult{}
 	if message, isMessage := event.(*ws.MessageEvent); isMessage {
 		matched, err := d.commands.Dispatch(ctx, message)
+		result.CommandMatched = matched
 		if matched || err != nil {
-			return DispatchResult{CommandMatched: matched}, err
+			return result, err
 		}
 	}
-	handled, err := d.observers.Dispatch(ctx, event)
-	return DispatchResult{ObserversHandled: handled}, err
+	afterHandled, err := d.observers.Dispatch(ctx, event)
+	result.ObserversHandled += afterHandled
+	return result, err
 }

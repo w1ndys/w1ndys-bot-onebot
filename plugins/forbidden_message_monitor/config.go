@@ -1,4 +1,4 @@
-// 📌 影响范围：定义违禁消息检测引擎的纯内存规则配置；不读取环境变量或外部服务。
+// 📌 影响范围：定义群内违禁消息监控的纯内存加权词规则；不读取环境变量或外部服务。
 package forbiddenmessagemonitor
 
 import (
@@ -7,102 +7,47 @@ import (
 	"math"
 )
 
-// RiskBand 表示规则评分后的检测分流。
+// RiskBand 表示本地累计权重是否达到直接处置阈值。
 type RiskBand string
 
 const (
-	RiskBandLow    RiskBand = "low"
-	RiskBandMedium RiskBand = "medium"
+	RiskBandReview RiskBand = "review"
 	RiskBandHigh   RiskBand = "high"
 )
 
-// WeightedKeyword 定义关键词及其风险权重。
+// WeightedKeyword 定义违禁词及其正向风险权重。
 type WeightedKeyword struct {
 	Text   string
 	Weight float64
 }
 
-// CombinationRule 定义所有词同时出现时的组合加成。
-type CombinationRule struct {
-	Terms []string
-	Bonus float64
-}
-
-// EngineConfig 定义纯内存检测规则与评分阈值。
+// EngineConfig 定义纯内存词库与直接处置阈值。
 type EngineConfig struct {
-	HardKeywords             []string
-	WeightedKeywords         []WeightedKeyword
-	SafeKeywords             []WeightedKeyword
-	Combinations             []CombinationRule
-	LowThreshold             float64
-	HighThreshold            float64
-	LengthNormalizationRunes int
+	WeightedKeywords   []WeightedKeyword
+	ViolationThreshold float64
 }
 
-// DefaultEngineConfig 返回可安全运行的保守默认配置。
-// @param 无。
-// @returns 阈值与长度归一化参数完整的默认配置。
-// ⚠️副作用说明：无。
+// DefaultEngineConfig 返回默认直接处置阈值。
 func DefaultEngineConfig() EngineConfig {
-	result := EngineConfig{
-		LowThreshold:             20,
-		HighThreshold:            60,
-		LengthNormalizationRunes: 80,
-	}
-
-	// >>> 数据演变示例
-	// 1. 空输入 -> 默认低/高阈值20/60 -> 可直接构造引擎。
-	// 2. 空输入 -> 长度归一化基准80 -> 长消息评分保持有界。
-	return result
+	return EngineConfig{ViolationThreshold: 60}
 }
 
-// validate 校验阈值、权重与组合规则，避免不可达分流。
-// @param config：待校验配置。
-// @returns 配置合法时nil，否则返回具体字段错误。
-// ⚠️副作用说明：无。
+// validate 校验阈值与权重，避免无法解释或无效的规则。
 func (config EngineConfig) validate() error {
-	// [决策理由] 分流阈值必须有序且非负，否则低中高区间含义不确定。
-	if !finite(config.LowThreshold) || !finite(config.HighThreshold) || config.LowThreshold < 0 || config.HighThreshold <= config.LowThreshold {
-		return errors.New("high threshold must be greater than non-negative low threshold")
+	if !finite(config.ViolationThreshold) || config.ViolationThreshold <= 0 || config.ViolationThreshold > maxTermWeight {
+		return fmt.Errorf("violation threshold must be between 1 and %d", maxTermWeight)
 	}
-	// [决策理由] 归一化基准必须为正，避免除零。
-	if config.LengthNormalizationRunes <= 0 {
-		return errors.New("length normalization runes must be positive")
-	}
-	for index, keyword := range append(append([]WeightedKeyword(nil), config.WeightedKeywords...), config.SafeKeywords...) {
-		// [决策理由] 空词会匹配所有消息，非有限权重会污染评分。
-		if keyword.Text == "" || !finite(keyword.Weight) || keyword.Weight < 0 {
-			return fmt.Errorf("keyword %d must have text and non-negative weight", index)
+	for index, keyword := range config.WeightedKeywords {
+		if keyword.Text == "" || !finite(keyword.Weight) || keyword.Weight <= 0 || keyword.Weight > maxTermWeight {
+			return fmt.Errorf("keyword %d must have text and weight between 1 and %d", index, maxTermWeight)
 		}
 	}
-	for index, combination := range config.Combinations {
-		// [决策理由] 空组合、空词或非有限加成会造成无条件或不可解释评分。
-		if len(combination.Terms) == 0 || !finite(combination.Bonus) {
-			return fmt.Errorf("combination %d must have terms and a finite bonus", index)
-		}
-		for _, term := range combination.Terms {
-			// [决策理由] 空字符串会匹配所有消息，破坏组合同时命中的语义。
-			if term == "" {
-				return fmt.Errorf("combination %d contains an empty term", index)
-			}
-		}
+	if len(config.WeightedKeywords) > 100000 {
+		return errors.New("too many weighted keywords")
 	}
-
-	// >>> 数据演变示例
-	// 1. 阈值20/60且归一化基准80 -> 全部约束通过 -> nil。
-	// 2. 阈值60/20 -> 区间倒置 -> 返回阈值错误。
 	return nil
 }
 
-// finite 判断浮点配置是否为有限数。
-// @param value：待检查浮点值。
-// @returns 非NaN且非正负无穷时为true。
-// ⚠️副作用说明：无。
 func finite(value float64) bool {
-	result := !math.IsNaN(value) && !math.IsInf(value, 0)
-
-	// >>> 数据演变示例
-	// 1. 20 -> 非NaN且非无穷 -> true。
-	// 2. NaN -> IsNaN命中 -> false。
-	return result
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

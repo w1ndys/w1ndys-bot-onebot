@@ -152,6 +152,7 @@ func TestPluginSpecValidateRejectsInvalidObservers(t *testing.T) {
 	}{
 		{name: "非法Key", edit: func(spec *PluginSpec) { spec.Observers[0].Key = "Events-1" }, want: "无效观察器 Key"},
 		{name: "空说明", edit: func(spec *PluginSpec) { spec.Observers[0].Description = "" }, want: "说明为空"},
+		{name: "未知阶段", edit: func(spec *PluginSpec) { spec.Observers[0].Phase = "during_commands" }, want: "未知执行阶段"},
 		{name: "空事件", edit: func(spec *PluginSpec) { spec.Observers[0].EventKinds = nil }, want: "至少需要一个群事件类型"},
 		{name: "未知事件", edit: func(spec *PluginSpec) { spec.Observers[0].EventKinds = []ObserverEventKind{"private_message"} }, want: "未知群事件类型"},
 		{name: "重复事件", edit: func(spec *PluginSpec) {
@@ -173,6 +174,15 @@ func TestPluginSpecValidateRejectsInvalidObservers(t *testing.T) {
 	// >>> 数据演变示例
 	// 1. group_message+Handler -> 合法观察入口。
 	// 2. private_message -> 不在群事件白名单 -> 返回错误。
+}
+
+func TestPluginSpecValidateAcceptsObserverPhases(t *testing.T) {
+	for _, phase := range []ObserverPhase{ObserverPhaseAfterCommands, ObserverPhaseBeforeCommands} {
+		spec := PluginSpec{Key: "observer_test", DisplayName: "观察测试", Description: "验证观察器阶段", Observers: []ObserverSpec{{Key: "events", Description: "观察群事件", Phase: phase, EventKinds: []ObserverEventKind{ObserverGroupMessage}, Handler: func(ObserverContext) error { return nil }}}}
+		if err := spec.Validate(); err != nil {
+			t.Errorf("phase %q: Validate() error = %v", phase, err)
+		}
+	}
 }
 
 func TestPluginSpecValidatesSmallConfigContract(t *testing.T) {

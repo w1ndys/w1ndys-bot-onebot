@@ -94,6 +94,16 @@ const (
 	ObserverGroupRequest ObserverEventKind = "group_request"
 )
 
+// ObserverPhase 表示观察器相对命令匹配的执行阶段。
+type ObserverPhase string
+
+const (
+	// ObserverPhaseAfterCommands 保持观察器仅接收未命中命令事件的默认行为。
+	ObserverPhaseAfterCommands ObserverPhase = ""
+	// ObserverPhaseBeforeCommands 在命令匹配前观察所有通过门禁的群事件。
+	ObserverPhaseBeforeCommands ObserverPhase = "before_commands"
+)
+
 // ObserverContext 是 Dispatcher 完成全局和群门禁后的观察事件输入。
 type ObserverContext struct {
 	Context context.Context
@@ -104,10 +114,11 @@ type ObserverContext struct {
 // ObserverHandler 处理一个已经通过运行门禁的群事件。
 type ObserverHandler func(ObserverContext) error
 
-// ObserverSpec 声明观察器稳定标识、群事件类别和处理器。
+// ObserverSpec 声明观察器稳定标识、执行阶段、群事件类别和处理器。
 type ObserverSpec struct {
 	Key         string
 	Description string
+	Phase       ObserverPhase
 	EventKinds  []ObserverEventKind
 	Handler     ObserverHandler
 }
@@ -231,6 +242,10 @@ func (s PluginSpec) Validate() error {
 		if strings.TrimSpace(observer.Description) == "" {
 			return fmt.Errorf("插件 %s 的观察器 %s 说明为空", s.Key, observer.Key)
 		}
+		// [决策理由] 未知阶段可能让安全观察器在命令前后错误执行，必须在启动时拒绝。
+		if !validObserverPhase(observer.Phase) {
+			return fmt.Errorf("插件 %s 的观察器 %s 包含未知执行阶段 %q", s.Key, observer.Key, observer.Phase)
+		}
 		// [决策理由] 空事件集合无法形成可审查的观察范围。
 		if len(observer.EventKinds) == 0 {
 			return fmt.Errorf("插件 %s 的观察器 %s 至少需要一个群事件类型", s.Key, observer.Key)
@@ -338,4 +353,9 @@ func validObserverEventKind(kind ObserverEventKind) bool {
 	// 1. group_message -> true。
 	// 2. private_message -> false。
 	return result
+}
+
+// validObserverPhase 判断观察器阶段是否属于编译期声明集合。
+func validObserverPhase(phase ObserverPhase) bool {
+	return phase == ObserverPhaseAfterCommands || phase == ObserverPhaseBeforeCommands
 }

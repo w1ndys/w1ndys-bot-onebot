@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/w1ndys/w1ndys-bot/internal/ws"
@@ -61,6 +62,41 @@ func newEventDispatcherTestSubject(t *testing.T, commandHandler CommandHandler, 
 	return dispatcher, runtime
 }
 
+func newPhasedEventDispatcherTestSubject(t *testing.T, commandHandler CommandHandler, beforeHandler, afterHandler ObserverHandler) (*EventDispatcher, *RuntimeController) {
+	t.Helper()
+	spec := PluginSpec{
+		Key:         "combined",
+		DisplayName: "分阶段分发测试",
+		Description: "验证命令前后观察器优先级",
+		Commands:    []CommandSpec{{Key: "run", DisplayName: "执行", Description: "测试命令", Triggers: []string{"run"}, Scope: CommandScopeGroup, AllowedRoles: Roles(RoleGroupMember), Handler: commandHandler}},
+		Observers: []ObserverSpec{
+			{Key: "before", Description: "命令前观察", Phase: ObserverPhaseBeforeCommands, EventKinds: []ObserverEventKind{ObserverGroupMessage, ObserverGroupNotice}, Handler: beforeHandler},
+			{Key: "after", Description: "命令后观察", EventKinds: []ObserverEventKind{ObserverGroupMessage, ObserverGroupNotice}, Handler: afterHandler},
+		},
+	}
+	catalog, err := NewSpecCatalog([]PluginSpec{spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands, err := NewDispatcher(catalog, runtime, eventDispatcherIdentity{role: RoleGroupMember})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observers, err := NewObserverDispatcher(catalog, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := NewEventDispatcher(commands, observers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dispatcher, runtime
+}
+
 func TestEventDispatcherCommandMatchSuppressesObservers(t *testing.T) {
 	commandCalls := 0
 	observerCalls := 0
@@ -80,6 +116,112 @@ func TestEventDispatcherCommandMatchSuppressesObservers(t *testing.T) {
 	result, err := dispatcher.Dispatch(context.Background(), &ws.MessageEvent{MessageType: "group", GroupID: 100, UserID: 200, RawMessage: "run value"})
 	if err != nil || !result.CommandMatched || result.ObserversHandled != 0 || commandCalls != 1 || observerCalls != 0 {
 		t.Fatalf("Dispatch() = %+v,%v command=%d observer=%d", result, err, commandCalls, observerCalls)
+	}
+}
+
+func TestEventDispatcherRunsBeforeObserverAheadOfMatchedCommand(t *testing.T) {
+	var calls []string
+	dispatcher, runtime := newPhasedEventDispatcherTestSubject(t, func(CommandContext) error {
+		calls = append(calls, "command")
+		return nil
+	}, func(ObserverContext) error {
+		calls = append(calls, "before")
+		return nil
+	}, func(ObserverContext) error {
+		calls = append(calls, "after")
+		return nil
+	})
+	if err := runtime.SetGroupEnabled("combined", 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Enable(context.Background(), "combined"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := dispatcher.Dispatch(context.Background(), &ws.MessageEvent{MessageType: "group", GroupID: 100, UserID: 200, RawMessage: "run"})
+	if err != nil || !result.CommandMatched || result.ObserversHandled != 1 || len(calls) != 2 || calls[0] != "before" || calls[1] != "command" {
+		t.Fatalf("Dispatch() = %+v,%v calls=%v", result, err, calls)
+	}
+}
+
+func TestEventDispatcherSplitDispatchDoesNotRepeatBeforeObserver(t *testing.T) {
+	var calls []string
+	dispatcher, runtime := newPhasedEventDispatcherTestSubject(t, func(CommandContext) error {
+		calls = append(calls, "command")
+		return nil
+	}, func(ObserverContext) error {
+		calls = append(calls, "before")
+		return nil
+	}, func(ObserverContext) error {
+		calls = append(calls, "after")
+		return nil
+	})
+	if err := runtime.SetGroupEnabled("combined", 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Enable(context.Background(), "combined"); err != nil {
+		t.Fatal(err)
+	}
+	event := &ws.MessageEvent{MessageType: "group", GroupID: 100, UserID: 200, RawMessage: "run"}
+	beforeHandled, err := dispatcher.DispatchBeforeCommands(context.Background(), event)
+	if err != nil || beforeHandled != 1 {
+		t.Fatalf("DispatchBeforeCommands() = %d,%v", beforeHandled, err)
+	}
+	result, err := dispatcher.DispatchAfterBeforeCommands(context.Background(), event)
+	result.ObserversHandled += beforeHandled
+	if err != nil || !result.CommandMatched || result.ObserversHandled != 1 || !reflect.DeepEqual(calls, []string{"before", "command"}) {
+		t.Fatalf("split dispatch = %+v,%v calls=%v", result, err, calls)
+	}
+}
+
+func TestEventDispatcherBeforeObserverErrorStopsCommandAndDefaultObservers(t *testing.T) {
+	beforeErr := errors.New("before failed")
+	commandCalls := 0
+	afterCalls := 0
+	dispatcher, runtime := newPhasedEventDispatcherTestSubject(t, func(CommandContext) error {
+		commandCalls++
+		return nil
+	}, func(ObserverContext) error {
+		return beforeErr
+	}, func(ObserverContext) error {
+		afterCalls++
+		return nil
+	})
+	if err := runtime.SetGroupEnabled("combined", 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Enable(context.Background(), "combined"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := dispatcher.Dispatch(context.Background(), &ws.MessageEvent{MessageType: "group", GroupID: 100, UserID: 200, RawMessage: "run"})
+	if !errors.Is(err, beforeErr) || result.CommandMatched || result.ObserversHandled != 1 || commandCalls != 0 || afterCalls != 0 {
+		t.Fatalf("Dispatch() = %+v,%v command=%d after=%d", result, err, commandCalls, afterCalls)
+	}
+}
+
+func TestEventDispatcherRunsBothObserverPhasesForUnmatchedGroupEvents(t *testing.T) {
+	var calls []string
+	dispatcher, runtime := newPhasedEventDispatcherTestSubject(t, func(CommandContext) error { return nil }, func(ObserverContext) error {
+		calls = append(calls, "before")
+		return nil
+	}, func(ObserverContext) error {
+		calls = append(calls, "after")
+		return nil
+	})
+	if err := runtime.SetGroupEnabled("combined", 100, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Enable(context.Background(), "combined"); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []ws.Event{
+		&ws.MessageEvent{MessageType: "group", GroupID: 100, UserID: 200, RawMessage: "unmatched"},
+		&ws.NoticeEvent{GroupID: 100},
+	} {
+		calls = nil
+		result, err := dispatcher.Dispatch(context.Background(), event)
+		if err != nil || result.CommandMatched || result.ObserversHandled != 2 || len(calls) != 2 || calls[0] != "before" || calls[1] != "after" {
+			t.Fatalf("Dispatch(%T) = %+v,%v calls=%v", event, result, err, calls)
+		}
 	}
 }
 

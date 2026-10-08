@@ -15,16 +15,6 @@ import (
 )
 
 const maxTextTestRunes = 4000
-const trustedTextTrialTTL = 10 * time.Minute
-const maxTrustedTextTrials = 1000
-const maxJavaScriptSafeInteger int64 = 9007199254740991
-
-type trustedTextTrial struct {
-	ActorID  string
-	Text     string
-	Features []string
-	Expires  time.Time
-}
 
 type textTestResourceHandler struct{ owner *implementation }
 
@@ -35,10 +25,11 @@ type textTestPayload struct {
 type textTestResult struct {
 	Decision        string   `json:"decision"`
 	Stage           string   `json:"stage"`
-	RiskBand        RiskBand `json:"risk_band"`
+	CleanedText     string   `json:"cleaned_text"`
+	CleanedLength   int      `json:"cleaned_length"`
 	LocalScore      float64  `json:"local_score"`
+	MatchedTerms    []string `json:"matched_terms"`
 	Reason          string   `json:"reason"`
-	Violations      []string `json:"violations"`
 	LLMUsed         bool     `json:"llm_used"`
 	LLMRiskLevel    string   `json:"llm_risk_level,omitempty"`
 	LLMTotalScore   int      `json:"llm_total_score,omitempty"`
@@ -61,7 +52,7 @@ func (h *textTestResourceHandler) List(_ context.Context, _ management.Actor, qu
 // @param ctx：请求上下文；actor：已授权管理员；raw：仅含text的JSON。
 // @returns 包含本地规则与可选LLM结论的临时资源记录。
 // ⚠️副作用说明：需要模型时会占用并发与当日请求额度并发送测试文本；不执行群管理或写违规审计。
-func (h *textTestResourceHandler) Create(ctx context.Context, actor management.Actor, raw json.RawMessage) (management.ResourceRecord, error) {
+func (h *textTestResourceHandler) Create(ctx context.Context, _ management.Actor, raw json.RawMessage) (management.ResourceRecord, error) {
 	payload, err := decodeTextTestPayload(raw)
 	// [决策理由] 无效或过长文本不得进入规则与外部模型。
 	if err != nil {
@@ -72,31 +63,51 @@ func (h *textTestResourceHandler) Create(ctx context.Context, actor management.A
 	if snapshot == nil || snapshot.engine == nil {
 		return management.ResourceRecord{}, fmt.Errorf("违禁消息检测配置尚未初始化")
 	}
-	exact := snapshot.engine.CheckExactText(payload.Text)
-	score := snapshot.engine.Score(payload.Text)
-	// [决策理由] 硬词和本地高风险先于模型长度门槛，短消息也不能绕过确定性规则。
-	if exact.Blocked {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "违规", Stage: "precise_rule", RiskBand: RiskBandHigh, Reason: strings.Join(exact.Reasons, ","), Violations: learnableExactFeatures(exact.Reasons), SuggestedAction: "block"})
+	cleaned := NormalizeDetectionText(payload.Text)
+	cleanedLength := len([]rune(cleaned))
+	base := textTestResult{CleanedText: cleaned, CleanedLength: cleanedLength, MatchedTerms: []string{}}
+	// [决策理由] 清洗后只有媒体或噪音的输入没有可检测内容，也不得发送给外部模型。
+	if cleaned == "" {
+		base.Decision = "放行"
+		base.Stage = "preprocessing"
+		base.Reason = "清洗后没有有效文本"
+		base.SuggestedAction = "pass"
+		return textTestRecord(base)
 	}
-	// [决策理由] 本地高风险无需调用模型，冷启动模式也保留该零成本处置。
+	score := snapshot.engine.Score(cleaned)
+	base.LocalScore = score.Score
+	base.MatchedTerms = score.MatchedTerms
+	// [决策理由] 本地累计权重达到阈值时无需调用模型。
 	if score.Band == RiskBandHigh {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "违规", Stage: "weighted_score", RiskBand: score.Band, LocalScore: score.Score, Reason: "加权关键词评分达到高风险阈值", Violations: score.MatchedRisk, SuggestedAction: "block"})
+		base.Decision = "违规"
+		base.Stage = "weighted_score"
+		base.Reason = "违禁词累计权重达到直接处置阈值"
+		base.SuggestedAction = "block"
+		return textTestRecord(base)
 	}
-	// [决策理由] 仅即将进入模型的消息应用长度门槛。
-	if messageBelowLLMMinimum(payload.Text, snapshot.minLLMMessageLength) {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "放行", Stage: "llm_length_filter", RiskBand: score.Band, LocalScore: score.Score, Reason: fmt.Sprintf("消息短于大模型最短检测长度%d", snapshot.minLLMMessageLength), Violations: score.MatchedRisk, SuggestedAction: "pass"})
+	// [决策理由] 长度门槛只计算清洗文本；短消息无论分数是否为零都不调用模型。
+	if messageBelowLLMMinimum(cleaned, snapshot.minLLMMessageLength) {
+		base.Decision = "放行"
+		base.Stage = "llm_length_filter"
+		base.Reason = fmt.Sprintf("清洗后文本短于大模型最短检测长度%d", snapshot.minLLMMessageLength)
+		base.SuggestedAction = "pass"
+		return textTestRecord(base)
 	}
-	// [决策理由] 常规模式低风险无需调用模型，冷启动模式则继续模型研判。
-	if snapshot.detectionMode != detectionModeColdStart && score.Band == RiskBandLow {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "放行", Stage: "weighted_score", RiskBand: score.Band, LocalScore: score.Score, Reason: "本地评分低于低风险阈值", Violations: score.MatchedRisk, SuggestedAction: "pass"})
-	}
-	// [决策理由] 模型未启用时中风险只能展示人工复核，不模拟自动处罚。
+	// [决策理由] 达到长度门槛后，即使本地零分也必须进入模型；不可用时明确返回人工复核。
 	if snapshot.evaluator == nil {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "人工复核", Stage: "weighted_score", RiskBand: score.Band, LocalScore: score.Score, Reason: "大模型未启用", Violations: score.MatchedRisk, SuggestedAction: "manual_review"})
+		base.Decision = "人工复核"
+		base.Stage = "llm"
+		base.Reason = "大模型未启用"
+		base.SuggestedAction = "manual_review"
+		return textTestRecord(base)
 	}
 	// [决策理由] 文本试判与真实流量共享并发上限，防止管理页面绕过资源保护。
 	if !h.owner.tryAcquireLLM(snapshot.llmMaxConcurrency) {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "人工复核", Stage: "llm", RiskBand: score.Band, LocalScore: score.Score, Reason: "大模型并发已满", Violations: score.MatchedRisk, SuggestedAction: "manual_review"})
+		base.Decision = "人工复核"
+		base.Stage = "llm"
+		base.Reason = "大模型并发已满"
+		base.SuggestedAction = "manual_review"
+		return textTestRecord(base)
 	}
 	defer h.owner.releaseLLM()
 	now := time.Now().UTC()
@@ -107,96 +118,35 @@ func (h *textTestResourceHandler) Create(ctx context.Context, actor management.A
 	reserved, err := h.owner.repository.TryReserveLLMRequest(ctx, now, snapshot.llmDailyRequestLimit)
 	// [决策理由] 额度状态不可确认或已耗尽时不得绕过预算调用外部模型。
 	if err != nil || !reserved {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "人工复核", Stage: "llm", RiskBand: score.Band, LocalScore: score.Score, Reason: "大模型每日额度不可用", Violations: score.MatchedRisk, SuggestedAction: "manual_review"})
+		base.Decision = "人工复核"
+		base.Stage = "llm"
+		base.Reason = "大模型每日额度不可用"
+		base.SuggestedAction = "manual_review"
+		return textTestRecord(base)
 	}
 	llmContext, cancel := context.WithTimeout(ctx, snapshot.llmTimeout)
 	defer cancel()
-	llmResult, err := snapshot.evaluator.Evaluate(llmContext, LLMEvaluationRequest{Message: payload.Text, BehaviorSummary: "WebUI文本试判，无真实用户行为上下文", Examples: []LLMExample{}})
+	llmResult, err := snapshot.evaluator.Evaluate(llmContext, LLMEvaluationRequest{Message: cleaned})
 	// [决策理由] 模型失败不能伪造安全结论，应把测试结果标为人工复核并保留本地证据。
 	if err != nil {
-		return h.trustedRecord(actor, payload.Text, textTestResult{Decision: "人工复核", Stage: "llm", RiskBand: score.Band, LocalScore: score.Score, Reason: "大模型研判失败", Violations: score.MatchedRisk, LLMUsed: true, SuggestedAction: "manual_review"})
+		base.Decision = "人工复核"
+		base.Stage = "llm"
+		base.Reason = "大模型研判失败"
+		base.LLMUsed = true
+		base.SuggestedAction = "manual_review"
+		return textTestRecord(base)
 	}
-	decision := textTestDecision(llmResult.SuggestedAction)
-	result := textTestResult{Decision: decision, Stage: "llm", RiskBand: score.Band, LocalScore: score.Score, Reason: llmResult.Reason, Violations: llmResult.Violations, LLMUsed: true, LLMRiskLevel: llmResult.RiskLevel, LLMTotalScore: llmResult.TotalScore, SuggestedAction: llmResult.SuggestedAction}
+	base.Decision = textTestDecision(llmResult.SuggestedAction)
+	base.Stage = "llm"
+	base.Reason = llmResult.Reason
+	base.LLMUsed = true
+	base.LLMRiskLevel = llmResult.RiskLevel
+	base.LLMTotalScore = llmResult.TotalScore
+	base.SuggestedAction = llmResult.SuggestedAction
 	// >>> 数据演变示例
-	// 1. 硬词文本 -> precise_rule -> 违规/block且不调用QQ。
-	// 2. 中风险+LLM Safe/pass -> llm -> 放行/pass。
-	return h.trustedRecord(actor, payload.Text, result)
-}
-
-// trustedRecord 编码试判结果并缓存服务端可信特征供一次主动投喂复用。
-// @param actor：管理员身份；text：试判原文；result：服务端判定结果。
-// @returns 临时资源记录或编码错误。
-// ⚠️副作用说明：在进程内保存十分钟、按管理员和试判ID绑定的可信特征。
-func (h *textTestResourceHandler) trustedRecord(actor management.Actor, text string, result textTestResult) (management.ResourceRecord, error) {
-	record, err := textTestRecord(result)
-	// [决策理由] 只有成功编码且身份可审计的试判才能生成投喂凭证。
-	if err != nil || strings.TrimSpace(actor.ID) == "" {
-		return record, err
-	}
-	rawFeatures, err := json.Marshal(result.Violations)
-	// [决策理由] 无法规范化的特征不得缓存为学习证据。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	features, err := baseLearningFeatures(text, rawFeatures)
-	// [决策理由] 特征必须真实存在于原文才能成为服务端可信凭证。
-	if err != nil {
-		return management.ResourceRecord{}, err
-	}
-	h.owner.trialMu.Lock()
-	defer h.owner.trialMu.Unlock()
-	// [决策理由] 缓存按需初始化，避免未使用文本试判的实例分配状态。
-	if h.owner.trials == nil {
-		h.owner.trials = make(map[int64]trustedTextTrial)
-	}
-	now := time.Now().UTC()
-	// [决策理由] 凭证创建与消费必须使用插件统一时钟，测试注入和生产行为才能一致。
-	if h.owner.now != nil {
-		now = h.owner.now()
-	}
-	for id, trial := range h.owner.trials {
-		// [决策理由] 过期凭证不再可用，写入新凭证时顺便清理以限制长期内存占用。
-		if now.After(trial.Expires) {
-			delete(h.owner.trials, id)
-		}
-	}
-	// [决策理由] 管理员高频试判必须保持硬上限；满载时逐出最早到期凭证，避免已产生的试判结果因缓存容量而失败。
-	if len(h.owner.trials) >= maxTrustedTextTrials {
-		var oldestID int64
-		var oldestExpiry time.Time
-		for id, trial := range h.owner.trials {
-			// [决策理由] 首项或更早到期项是容量逐出的最小影响目标。
-			if oldestID == 0 || trial.Expires.Before(oldestExpiry) {
-				oldestID = id
-				oldestExpiry = trial.Expires
-			}
-		}
-		delete(h.owner.trials, oldestID)
-	}
-	for attempts := 0; attempts <= len(h.owner.trials); attempts++ {
-		h.owner.trialSequence++
-		// [决策理由] 每次尝试都执行回绕，碰撞在边界值时也不会产生JavaScript不安全整数。
-		if h.owner.trialSequence > maxJavaScriptSafeInteger {
-			h.owner.trialSequence = 1
-		}
-		_, occupied := h.owner.trials[h.owner.trialSequence]
-		// [决策理由] 首个未占用的安全整数即可作为进程内短时凭证ID。
-		if !occupied {
-			record.ID = h.owner.trialSequence
-			break
-		}
-	}
-	// [决策理由] 有界缓存理论上总能找到空ID，防御性检查避免未来约束变化时覆盖凭证。
-	if record.ID == 0 {
-		return management.ResourceRecord{}, fmt.Errorf("无法分配文本试判凭证")
-	}
-	h.owner.trials[record.ID] = trustedTextTrial{ActorID: actor.ID, Text: text, Features: features, Expires: now.Add(trustedTextTrialTTL)}
-
-	// >>> 数据演变示例
-	// 1. trial7+管理员A+[扫码] -> 缓存十分钟 -> 可保存一次。
-	// 2. 空模型词 -> 缓存空特征 -> 可保存Few-shot正例但不晋级候选词。
-	return record, nil
+	// 1. 高权重短文本 -> weighted_score -> 违规/block且不调用QQ。
+	// 2. 零分长文本+LLM pass -> llm -> 放行/pass。
+	return textTestRecord(base)
 }
 
 // Update 拒绝修改临时试判结果。

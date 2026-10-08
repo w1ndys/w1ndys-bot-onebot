@@ -436,7 +436,7 @@ onMounted(loadStates)
     </NSpace>
     <NCard title="群开关维护">
       <NAlert type="warning" title="操作边界">
-        复制采用合并模式，只覆盖源群显式存在的插件开关；清理只删除已经退出群的门禁记录，不删除关键词、违规记录、训练样本等插件业务数据。
+        复制采用合并模式，只覆盖源群显式存在的插件开关；清理只删除已经退出群的门禁记录，不删除违禁词、违规记录等插件业务数据。
       </NAlert>
       <div class="maintenance-grid">
         <NSpace vertical>

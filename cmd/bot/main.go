@@ -28,6 +28,16 @@ import (
 	keywordreply "github.com/w1ndys/w1ndys-bot/plugins/keyword_reply"
 )
 
+type targetEventDispatcher interface {
+	Dispatch(context.Context, ws.Event) (plugin.DispatchResult, error)
+	DispatchBeforeCommands(context.Context, ws.Event) (int, error)
+	DispatchAfterBeforeCommands(context.Context, ws.Event) (plugin.DispatchResult, error)
+}
+
+type emergencyCommandHandler interface {
+	Handle(context.Context, *ws.MessageEvent, string) (bool, error)
+}
+
 // main 启动机器人基础设施。
 // @param 无。
 // @returns 无。
@@ -84,27 +94,11 @@ func main() {
 	}
 	adminService := admin.NewService(adminRepository, settingsResolver, adminResolver)
 	// [决策理由] 目标架构入口依赖只能在 botAPI 就绪后构建，但 WS 回调必须更早注册；监听开始前完成赋值，回调不会读到 nil。
-	var targetDispatcher *plugin.EventDispatcher
-	var emergencyHandler *adminplugin.EmergencyHandler
+	var targetDispatcher targetEventDispatcher
+	var emergencyHandler emergencyCommandHandler
 	wsServer := ws.NewServer(cfg.NapCatToken, func(_ context.Context, event ws.Event) error {
 		logEvent(event)
-		message, isMessage := event.(*ws.MessageEvent)
-		if isMessage && emergencyHandler != nil && adminResolver.IsSuperAdmin(strconv.FormatInt(message.UserID, 10)) {
-			matched, emergencyErr := emergencyHandler.Handle(ctx, message, settingsResolver.CommandPrefix())
-			if matched {
-				return emergencyErr
-			}
-		}
-		if targetDispatcher != nil && (!isMessage || message.MessageType == "group") {
-			result, dispatchErr := targetDispatcher.Dispatch(ctx, event)
-			if result.CommandMatched {
-				return targetCommandError(dispatchErr)
-			}
-			if dispatchErr != nil {
-				projectlogger.Error("目标插件观察链处理事件失败", "error", dispatchErr)
-			}
-		}
-		return nil
+		return dispatchBotEvent(ctx, event, targetDispatcher, emergencyHandler, adminResolver.IsSuperAdmin, settingsResolver.CommandPrefix())
 	})
 	botAPI := onebot.New(wsServer.Actions())
 	echoSpec, err := echo.Spec(botAPI)
@@ -251,6 +245,44 @@ func main() {
 	// 2. 缺少 DB_PASSWORD -> 配置校验错误 -> 输出错误日志 -> 进程终止。
 }
 
+// dispatchBotEvent 保证群内应急命令与编译期命令共享同一次命令前安全观察。
+func dispatchBotEvent(ctx context.Context, event ws.Event, target targetEventDispatcher, emergency emergencyCommandHandler, isSuperAdmin func(string) bool, prefix string) error {
+	message, isMessage := event.(*ws.MessageEvent)
+	superAdminMessage := isMessage && message != nil && emergency != nil && isSuperAdmin != nil && isSuperAdmin(strconv.FormatInt(message.UserID, 10))
+	beforeDispatched := false
+	// [决策理由] 应急命令位于编译期命令目录之外，群消息必须先单独执行安全观察，且后续不能重复执行。
+	if superAdminMessage && message.MessageType == "group" && target != nil {
+		if _, err := target.DispatchBeforeCommands(ctx, event); err != nil {
+			projectlogger.Error("目标插件命令前观察链处理事件失败", "error", err)
+			return nil
+		}
+		beforeDispatched = true
+	}
+	if superAdminMessage {
+		matched, err := emergency.Handle(ctx, message, prefix)
+		if matched {
+			return err
+		}
+	}
+	if target == nil || (isMessage && (message == nil || message.MessageType != "group")) {
+		return nil
+	}
+	var result plugin.DispatchResult
+	var dispatchErr error
+	if beforeDispatched {
+		result, dispatchErr = target.DispatchAfterBeforeCommands(ctx, event)
+	} else {
+		result, dispatchErr = target.Dispatch(ctx, event)
+	}
+	if result.CommandMatched {
+		return targetCommandError(dispatchErr)
+	}
+	if dispatchErr != nil {
+		projectlogger.Error("目标插件观察链处理事件失败", "error", dispatchErr)
+	}
+	return nil
+}
+
 // targetCommandError 过滤目标插件命令链路中属于正常拒绝的门禁结果。
 // @param err：EventDispatcher 命中命令后返回的错误。
 // @returns 需要上报的错误；运行门禁与授权拒绝返回 nil。
@@ -338,7 +370,7 @@ func logEvent(event ws.Event) {
 	logger := projectlogger.With("event_type", event.Name(), "self_id", event.Base().SelfID)
 	switch current := event.(type) {
 	case *ws.MessageEvent:
-		logger.Info("收到消息事件", "group_id", current.GroupID, "user_id", current.UserID, "message_id", current.MessageID, "raw_message", current.RawMessage)
+		logger.Info("收到消息事件", "group_id", current.GroupID, "user_id", current.UserID, "message_id", current.MessageID)
 	case *ws.HeartbeatEvent:
 		logger.Debug("收到心跳事件", "interval", current.Interval, "status", current.Status.String())
 	case *ws.LifecycleEvent:

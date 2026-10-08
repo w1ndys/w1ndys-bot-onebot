@@ -32,18 +32,93 @@ type blockingMaintenanceRepository struct {
 	release chan struct{}
 }
 
+type contextBlockingMaintenanceRepository struct {
+	*fakeMonitorRepository
+	started chan struct{}
+}
+
+type maintenanceContextKey struct{}
+
+func (f *contextBlockingMaintenanceRepository) ListObservedGroups(ctx context.Context) ([]int64, error) {
+	if ctx.Value(maintenanceContextKey{}) == true {
+		select {
+		case f.started <- struct{}{}:
+		default:
+		}
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type maintenanceActions struct {
+	*fakeActions
+	memberListCalls  []string
+	memberListErrors map[string]error
+	waitForCancel    map[string]bool
+	members          map[string][]onebot.GroupMemberInfo
+}
+
+func (f *maintenanceActions) GetGroupMemberList(ctx context.Context, params onebot.GetGroupMemberListParams) ([]onebot.GroupMemberInfo, error) {
+	f.memberListCalls = append(f.memberListCalls, params.GroupID)
+	if f.waitForCancel[params.GroupID] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return f.members[params.GroupID], f.memberListErrors[params.GroupID]
+}
+
+type maintenanceRepository struct {
+	*fakeMonitorRepository
+	groups           []int64
+	listCalls        int
+	recentCalls      []int64
+	recentErrors     map[int64]error
+	replaceCalls     []int64
+	replacementError map[int64]error
+}
+
+func (f *maintenanceRepository) ListObservedGroups(context.Context) ([]int64, error) {
+	f.listCalls++
+	return f.groups, nil
+}
+
+func (f *maintenanceRepository) RecentValidCounts(_ context.Context, groupID int64, _ time.Time) (map[int64]int, error) {
+	f.recentCalls = append(f.recentCalls, groupID)
+	return map[int64]int{}, f.recentErrors[groupID]
+}
+
+func (f *maintenanceRepository) ReplaceWhitelist(_ context.Context, groupID int64, _ []int64, _ time.Time) error {
+	f.replaceCalls = append(f.replaceCalls, groupID)
+	return f.replacementError[groupID]
+}
+
+type blockingEnableLifecycle struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (l *blockingEnableLifecycle) OnEnable(context.Context) error {
+	close(l.started)
+	<-l.release
+	return nil
+}
+
+func (*blockingEnableLifecycle) OnDisable(context.Context) error { return nil }
+
 type fakeLLMEvaluator struct {
-	calls  int
-	result LLMEvaluationResult
-	err    error
+	calls    int
+	requests []LLMEvaluationRequest
+	result   LLMEvaluationResult
+	err      error
 }
 
 // Evaluate 返回预设模型结论并记录调用次数。
 // @param ctx/request：模型调用参数。
 // @returns 预设结果与错误。
 // ⚠️副作用说明：递增calls。
-func (f *fakeLLMEvaluator) Evaluate(context.Context, LLMEvaluationRequest) (LLMEvaluationResult, error) {
+func (f *fakeLLMEvaluator) Evaluate(_ context.Context, request LLMEvaluationRequest) (LLMEvaluationResult, error) {
 	f.calls++
+	f.requests = append(f.requests, request)
 
 	// >>> 数据演变示例
 	// 1. Low/pass -> calls1 -> 返回安全结论。
@@ -136,8 +211,8 @@ func (f *fakeActions) DeleteMessage(_ context.Context, messageID any) error {
 func testImplementation() *implementation {
 	engineConfig := DefaultEngineConfig()
 	engine, _ := NewEngine(engineConfig)
-	result := &implementation{actions: &fakeActions{}, repository: &fakeMonitorRepository{}, lexiconStore: staticLexicon{}, httpClient: &http.Client{}, now: func() time.Time { return time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC) }}
-	result.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: engineConfig, llmTimeout: time.Second})
+	result := &implementation{actions: &fakeActions{}, repository: &fakeMonitorRepository{}, lexiconStore: staticLexicon{}, httpClient: &http.Client{}, maintenanceTimeout: maintenanceRunTimeout, now: func() time.Time { return time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC) }}
+	result.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: engineConfig, llmTimeout: time.Second, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 30})
 
 	// >>> 数据演变示例
 	// 1. 默认配置 -> Engine -> 可执行实例。
@@ -162,13 +237,28 @@ func TestSpecContract(t *testing.T) {
 	if len(spec.Commands) != 0 || len(spec.Observers) != 1 || len(spec.Observers[0].EventKinds) != 2 {
 		t.Fatalf("observers = %+v", spec.Observers)
 	}
+	if spec.Observers[0].Phase != plugin.ObserverPhaseBeforeCommands {
+		t.Fatalf("observer phase = %q", spec.Observers[0].Phase)
+	}
 	// 阈值与模型参数属于小型标量配置，词库不再出现在 Schema 中。
 	if spec.Config == nil || spec.Lifecycle == nil {
 		t.Fatalf("config/lifecycle missing: %+v", spec)
 	}
+	configKeys := make(map[string]struct{}, len(spec.Config.Schema.Fields))
 	for _, field := range spec.Config.Schema.Fields {
+		configKeys[field.Key] = struct{}{}
 		if strings.HasSuffix(field.Key, "_json") {
 			t.Fatalf("结构化字段仍在小型配置中: %s", field.Key)
+		}
+	}
+	for _, required := range []string{"violation_weight_threshold", "min_llm_message_length"} {
+		if _, exists := configKeys[required]; !exists {
+			t.Fatalf("missing config field %q", required)
+		}
+	}
+	for _, removed := range []string{"low_threshold", "high_threshold", "detection_mode"} {
+		if _, exists := configKeys[removed]; exists {
+			t.Fatalf("removed config field still exists: %q", removed)
 		}
 	}
 }
@@ -243,6 +333,243 @@ func TestRefreshLexiconFailureFailsRuntimeClosed(t *testing.T) {
 	}
 }
 
+func TestMaintenanceSkipsDisabledGroup(t *testing.T) {
+	repository := &maintenanceRepository{fakeMonitorRepository: &fakeMonitorRepository{}}
+	repository.groups = []int64{100}
+	actions := &maintenanceActions{fakeActions: &fakeActions{}}
+	instance := testImplementation()
+	instance.repository = repository
+	instance.actions = actions
+	service := &Service{implementation: instance}
+	controller := newManagementRuntime(t)
+	if err := service.BindRuntimeController(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Enable(context.Background(), pluginKey); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := instance.runMaintenance(context.Background()); err != nil {
+		t.Fatalf("runMaintenance() error = %v", err)
+	}
+	if repository.listCalls != 1 || len(actions.memberListCalls) != 0 || len(repository.recentCalls) != 0 || len(repository.replaceCalls) != 0 {
+		t.Fatalf("list=%d actions=%v recent=%v replacements=%v", repository.listCalls, actions.memberListCalls, repository.recentCalls, repository.replaceCalls)
+	}
+	state, ok := controller.State(pluginKey)
+	if !ok || state.InFlight != 0 {
+		t.Fatalf("runtime state after maintenance = %+v, %v", state, ok)
+	}
+}
+
+func TestMaintenanceContinuesAfterGroupFailures(t *testing.T) {
+	actionFailure := errors.New("group 100 unavailable")
+	databaseFailure := errors.New("group 300 counts unavailable")
+	writeFailure := errors.New("group 200 whitelist unavailable")
+	repository := &maintenanceRepository{
+		fakeMonitorRepository: &fakeMonitorRepository{},
+		groups:                []int64{100, 200, 300, 400},
+		recentErrors:          map[int64]error{300: databaseFailure},
+		replacementError:      map[int64]error{200: writeFailure},
+	}
+	actions := &maintenanceActions{
+		fakeActions:      &fakeActions{},
+		memberListErrors: map[string]error{"100": actionFailure},
+	}
+	instance := testImplementation()
+	instance.repository = repository
+	instance.actions = actions
+	service := &Service{implementation: instance}
+	controller := newManagementRuntime(t)
+	if err := service.BindRuntimeController(controller); err != nil {
+		t.Fatal(err)
+	}
+	for _, groupID := range repository.groups {
+		if err := controller.SetGroupEnabled(pluginKey, groupID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := controller.Enable(context.Background(), pluginKey); err != nil {
+		t.Fatal(err)
+	}
+
+	err := instance.runMaintenance(context.Background())
+	if !errors.Is(err, actionFailure) || !errors.Is(err, databaseFailure) || !errors.Is(err, writeFailure) {
+		t.Fatalf("runMaintenance() error = %v", err)
+	}
+	if got := strings.Join(actions.memberListCalls, ","); got != "100,200,300,400" {
+		t.Fatalf("member list calls = %s", got)
+	}
+	if len(repository.recentCalls) != 3 || repository.recentCalls[0] != 200 || repository.recentCalls[1] != 300 || repository.recentCalls[2] != 400 {
+		t.Fatalf("recent calls = %v", repository.recentCalls)
+	}
+	if len(repository.replaceCalls) != 2 || repository.replaceCalls[0] != 200 || repository.replaceCalls[1] != 400 {
+		t.Fatalf("replace calls = %v", repository.replaceCalls)
+	}
+	state, ok := controller.State(pluginKey)
+	if !ok || state.InFlight != 0 {
+		t.Fatalf("runtime state after maintenance = %+v, %v", state, ok)
+	}
+}
+
+func TestMaintenanceDeadlineAllowsRuntimeDisableToDrain(t *testing.T) {
+	repository := &contextBlockingMaintenanceRepository{fakeMonitorRepository: &fakeMonitorRepository{}, started: make(chan struct{}, 2)}
+	instance := testImplementation()
+	instance.repository = repository
+	instance.maintenanceTimeout = 200 * time.Millisecond
+	service := &Service{implementation: instance}
+	catalog, err := plugin.NewSpecCatalog([]plugin.PluginSpec{service.Spec()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := plugin.NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.BindRuntimeController(controller); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Enable(context.Background(), pluginKey); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+		defer cleanupCancel()
+		_ = controller.Disable(cleanupContext, pluginKey)
+	})
+	maintenanceResult := make(chan error, 1)
+	go func() {
+		maintenanceContext := context.WithValue(context.Background(), maintenanceContextKey{}, true)
+		maintenanceResult <- instance.runMaintenance(maintenanceContext)
+	}()
+	select {
+	case <-repository.started:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not acquire runtime admission")
+	}
+	state, ok := controller.State(pluginKey)
+	if !ok || state.InFlight < 1 {
+		t.Fatalf("runtime state before disable = %+v, %v", state, ok)
+	}
+	disableContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := controller.Disable(disableContext, pluginKey); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	if err := <-maintenanceResult; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runMaintenance() error = %v", err)
+	}
+	state, ok = controller.State(pluginKey)
+	if !ok || state.Status != plugin.RuntimeDisabled || state.InFlight != 0 {
+		t.Fatalf("runtime state after disable = %+v, %v", state, ok)
+	}
+	instance.lifecycleMu.Lock()
+	workerCleared := instance.cancel == nil && instance.done == nil
+	instance.lifecycleMu.Unlock()
+	if !workerCleared {
+		t.Fatal("maintenance worker was not released")
+	}
+}
+
+func TestMaintenanceDeadlineRotatesToLaterGroups(t *testing.T) {
+	repository := &maintenanceRepository{fakeMonitorRepository: &fakeMonitorRepository{}, groups: []int64{100, 200}}
+	actions := &maintenanceActions{fakeActions: &fakeActions{}, waitForCancel: map[string]bool{"100": true}}
+	instance := testImplementation()
+	instance.repository = repository
+	instance.actions = actions
+	instance.maintenanceTimeout = 20 * time.Millisecond
+	service := &Service{implementation: instance}
+	controller := newManagementRuntime(t)
+	if err := service.BindRuntimeController(controller); err != nil {
+		t.Fatal(err)
+	}
+	for _, groupID := range repository.groups {
+		if err := controller.SetGroupEnabled(pluginKey, groupID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := controller.Enable(context.Background(), pluginKey); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := instance.runMaintenance(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first runMaintenance() error = %v", err)
+	}
+	if err := instance.runMaintenance(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second runMaintenance() error = %v", err)
+	}
+	if got := strings.Join(actions.memberListCalls, ","); got != "100,200,100" {
+		t.Fatalf("member list calls = %s", got)
+	}
+	if len(repository.replaceCalls) != 1 || repository.replaceCalls[0] != 200 {
+		t.Fatalf("replace calls = %v", repository.replaceCalls)
+	}
+}
+
+func TestMaintenanceRejectsEnablingRuntimeAndUsesRetryInterval(t *testing.T) {
+	lifecycle := &blockingEnableLifecycle{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-lifecycle.release:
+		default:
+			close(lifecycle.release)
+		}
+	})
+	catalog, err := plugin.NewSpecCatalog([]plugin.PluginSpec{{
+		Key: pluginKey, DisplayName: "违禁监控", Description: "测试 enabling 门禁", Lifecycle: lifecycle,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := plugin.NewRuntimeController(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &maintenanceRepository{fakeMonitorRepository: &fakeMonitorRepository{}, groups: []int64{100}}
+	instance := testImplementation()
+	instance.repository = repository
+	service := &Service{implementation: instance}
+	if err := service.BindRuntimeController(nil); err == nil {
+		t.Fatal("BindRuntimeController(nil) error = nil")
+	}
+	if err := service.BindRuntimeController(controller); err != nil {
+		t.Fatal(err)
+	}
+	if instance.runtimeGate != controller {
+		t.Fatal("BindRuntimeController() did not inject maintenance gate")
+	}
+	enableResult := make(chan error, 1)
+	go func() {
+		enableResult <- controller.Enable(context.Background(), pluginKey)
+	}()
+	select {
+	case <-lifecycle.started:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not enter enabling")
+	}
+	state, ok := controller.State(pluginKey)
+	if !ok || state.Status != plugin.RuntimeEnabling {
+		t.Fatalf("runtime state = %+v, %v", state, ok)
+	}
+
+	err = instance.runMaintenance(context.Background())
+	if err == nil {
+		t.Fatal("runMaintenance() error = nil while enabling")
+	}
+	if repository.listCalls != 0 {
+		t.Fatalf("ListObservedGroups() calls = %d", repository.listCalls)
+	}
+	if got := nextMaintenanceInterval(err); got != maintenanceRetryInterval {
+		t.Fatalf("nextMaintenanceInterval(error) = %v", got)
+	}
+	if got := nextMaintenanceInterval(nil); got != maintenanceInterval {
+		t.Fatalf("nextMaintenanceInterval(nil) = %v", got)
+	}
+	close(lifecycle.release)
+	if err := <-enableResult; err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+}
+
 // TestConstructorDependencies 验证构造依赖边界。
 // @param t：Go测试上下文。
 // @returns 无。
@@ -301,6 +628,11 @@ func TestDisableTimeoutKeepsWorkerGeneration(t *testing.T) {
 	repository := &blockingMaintenanceRepository{fakeMonitorRepository: &fakeMonitorRepository{}, started: make(chan struct{}), release: make(chan struct{})}
 	instance := testImplementation()
 	instance.repository = repository
+	controller := newManagementRuntime(t)
+	if err := controller.Enable(context.Background(), pluginKey); err != nil {
+		t.Fatal(err)
+	}
+	instance.runtimeGate = controller
 	// [决策理由] 启用不能等待首次维护，否则NapCat尚未连接时会阻塞服务启动。
 	if err := instance.OnEnable(context.Background()); err != nil {
 		t.Fatalf("OnEnable() error = %v", err)
@@ -389,130 +721,75 @@ func TestHandleIgnoresUnsupportedEvents(t *testing.T) {
 	// 2. heartbeat -> nil且不访问Action。
 }
 
-// TestColdStartSendsLowRiskMessageToLLM 验证冷启动模式不会因空词库零分绕过模型。
-// @param t：Go测试上下文。
-// @returns 无。
-// ⚠️副作用说明：调用内存fake模型一次。
-func TestColdStartSendsLowRiskMessageToLLM(t *testing.T) {
+func TestZeroScoreLongMessageUsesLLM(t *testing.T) {
 	instance := testImplementation()
 	evaluator := &fakeLLMEvaluator{result: LLMEvaluationResult{RiskLevel: "Low", TotalScore: 5, Reason: "普通交流", Violations: []string{}, SuggestedAction: "pass"}}
 	current := instance.snapshot.Load()
-	instance.snapshot.Store(&runtimeSnapshot{engine: current.engine, engineConfig: current.engineConfig, evaluator: evaluator, llmTimeout: time.Second, detectionMode: detectionModeColdStart, llmMaxConcurrency: 2, llmDailyRequestLimit: 500})
-	event := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 9, RawMessage: "普通聊天内容"}
-	err := dispatchEvent(instance, context.Background(), event)
-	// [决策理由] 冷启动低分消息必须调用模型，Safe/Low结论直接放行且不生成违规记录。
-	if err != nil || evaluator.calls != 1 {
-		t.Fatalf("Handle() error=%v calls=%d", err, evaluator.calls)
+	instance.snapshot.Store(&runtimeSnapshot{engine: current.engine, engineConfig: current.engineConfig, evaluator: evaluator, llmTimeout: time.Second, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 8})
+	event := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 9, RawMessage: "这 是、尚未收录的新型内容[CQ:image,file=secret.jpg]"}
+	if err := dispatchEvent(instance, context.Background(), event); err != nil {
+		t.Fatal(err)
 	}
-	repository := instance.repository.(*fakeMonitorRepository)
-	// [决策理由] 模型明确pass时不得污染人工复核队列。
-	if len(repository.created) != 0 {
-		t.Fatalf("created violations = %+v", repository.created)
+	if evaluator.calls != 1 || len(evaluator.requests) != 1 || evaluator.requests[0].Message != "这是尚未收录的新型内容" {
+		t.Fatalf("calls=%d requests=%+v", evaluator.calls, evaluator.requests)
 	}
-
-	// >>> 数据演变示例
-	// 1. 空词库score0+cold_start -> LLM Low/pass -> 放行。
-	// 2. 同消息standard -> 本地low直接放行且不调用LLM。
+	if created := instance.repository.(*fakeMonitorRepository).created; len(created) != 0 {
+		t.Fatalf("pass result created violations: %+v", created)
+	}
 }
 
-// TestLLMMinimumLengthOnlySkipsModel 验证长度门槛不影响本地硬词且会跳过短消息模型调用。
-// @param t：Go测试上下文。
-// @returns 无。
-// ⚠️副作用说明：使用内存fake执行一次本地处置并检查模型调用次数。
-func TestLLMMinimumLengthOnlySkipsModel(t *testing.T) {
+func TestShortZeroScoreAndHighLocalScoreDoNotUseLLM(t *testing.T) {
 	instance := testImplementation()
-	evaluator := &fakeLLMEvaluator{result: LLMEvaluationResult{RiskLevel: "Low", TotalScore: 5, SuggestedAction: "pass"}}
-	config := DefaultEngineConfig()
-	config.HardKeywords = []string{"短广告"}
+	evaluator := &fakeLLMEvaluator{result: LLMEvaluationResult{RiskLevel: "Low", TotalScore: 5, Reason: "普通交流", Violations: []string{}, SuggestedAction: "pass"}}
+	config := EngineConfig{ViolationThreshold: 60, WeightedKeywords: []WeightedKeyword{{Text: "短广告", Weight: 60}}}
 	engine, err := NewEngine(config)
-	// [决策理由] 测试规则必须成功构造才能验证检测顺序。
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: config, evaluator: evaluator, llmTimeout: time.Second, detectionMode: detectionModeColdStart, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 30})
-	shortSafe := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 10, RawMessage: "普通短消息"}
-	// [决策理由] 未命中本地高风险且不足30字符时必须在外部调用前放行。
-	if err := dispatchEvent(instance, context.Background(), shortSafe); err != nil || evaluator.calls != 0 {
-		t.Fatalf("short Handle() error=%v calls=%d", err, evaluator.calls)
+	instance.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: config, evaluator: evaluator, llmTimeout: time.Second, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 30})
+	short := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 10, RawMessage: "普通短消息"}
+	if err := dispatchEvent(instance, context.Background(), short); err != nil {
+		t.Fatal(err)
 	}
-	shortBlocked := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 201, MessageID: 11, RawMessage: "短广告"}
-	// [决策理由] 长度门槛不能绕过位于前面的硬关键词处置。
-	if err := dispatchEvent(instance, context.Background(), shortBlocked); err != nil {
-		t.Fatalf("blocked Handle() error=%v", err)
+	high := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: time.Now().Unix()}, MessageType: "group", GroupID: 100, UserID: 201, MessageID: 11, RawMessage: "短、广 告"}
+	if err := dispatchEvent(instance, context.Background(), high); err != nil {
+		t.Fatal(err)
 	}
-	actions := instance.actions.(*fakeActions)
-	// [决策理由] 短硬词应执行本地禁言且仍不调用模型。
-	if len(actions.banParams) != 1 || evaluator.calls != 0 {
-		t.Fatalf("bans=%d calls=%d", len(actions.banParams), evaluator.calls)
+	if evaluator.calls != 0 || len(instance.actions.(*fakeActions).banParams) != 1 {
+		t.Fatalf("calls=%d bans=%d", evaluator.calls, len(instance.actions.(*fakeActions).banParams))
 	}
-
-	// >>> 数据演变示例
-	// 1. 5字符普通消息+minimum30 -> 跳过LLM放行。
-	// 2. 3字符硬词消息+minimum30 -> 本地block，LLM仍为0次。
 }
 
-// TestPublishWeightOffsetsKeepsHardKeywordWithoutNegativeEvidence 验证正向晋级不会被误认为硬词误报。
-// @param t：Go测试上下文。
-// @returns 无。
-// ⚠️副作用说明：替换测试实例的内存检测快照。
-func TestPublishWeightOffsetsKeepsHardKeywordWithoutNegativeEvidence(t *testing.T) {
-	instance := testImplementation()
+func TestLLMReceivesCleanedTextAndAuditKeepsRawMessage(t *testing.T) {
+	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	repository := &fakeMonitorRepository{}
+	actions := &fakeActions{}
+	evaluator := &fakeLLMEvaluator{result: LLMEvaluationResult{RiskLevel: "High", TotalScore: 90, Reason: "新型引流", Violations: []string{"新型引流"}, SuggestedAction: "block"}}
 	config := DefaultEngineConfig()
-	config.HardKeywords = []string{"内部渠道"}
 	engine, err := NewEngine(config)
-	// [决策理由] 测试基础硬词引擎必须成功构造。
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: config, minLLMMessageLength: 30})
-	// [决策理由] 仅有正向学习权重时不得移除管理员设置的零容错硬词。
-	if err := instance.publishWeightOffsets(map[string]float64{"内部渠道": 10}, map[string]struct{}{}); err != nil {
-		t.Fatalf("publishWeightOffsets() error = %v", err)
-	}
-	result := instance.snapshot.Load().engine.CheckExactText("内部渠道")
-	// [决策理由] 发布后硬词仍应在精准层直接命中。
-	if !result.Blocked {
-		t.Fatalf("CheckExactText() = %+v", result)
-	}
-	// [决策理由] 每日学习发布只替换检测引擎，不得清空已热应用的模型调用长度门槛。
-	if got := instance.snapshot.Load().minLLMMessageLength; got != 30 {
-		t.Fatalf("minLLMMessageLength=%d", got)
-	}
-
-	// >>> 数据演变示例
-	// 1. hard词+learned10+无误报 -> 保留hard拦截。
-	// 2. minimum30+发布学习权重 -> 新快照仍保持minimum30。
-}
-
-func TestReloadLexiconPreservesNegativeFeedback(t *testing.T) {
-	instance := testImplementation()
-	lexicon := Lexicon{Hard: []string{"内部渠道"}}
-	instance.lexiconStore = staticLexicon{lexicon: lexicon}
-	instance.lexicon.Store(&lexicon)
-	snapshot, err := buildRuntimeSnapshot(instance.currentConfigJSON(), lexicon, instance.httpClient)
-	if err != nil {
+	instance := &implementation{actions: actions, repository: repository, now: func() time.Time { return now }}
+	instance.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: config, evaluator: evaluator, llmTimeout: time.Second, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 4})
+	raw := "新 型、引\n流内容[CQ:image,file=secret.jpg]"
+	event := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message", Time: now.Unix()}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 12, MessageSeq: 222, RawMessage: raw}
+	if err := dispatchEvent(instance, context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
-	instance.snapshot.Store(snapshot)
-	if err := instance.publishWeightOffsets(map[string]float64{"内部渠道": -10}, map[string]struct{}{"内部渠道": {}}); err != nil {
-		t.Fatal(err)
+	if len(evaluator.requests) != 1 || evaluator.requests[0].Message != "新型引流内容" {
+		t.Fatalf("requests = %+v", evaluator.requests)
 	}
-	if instance.snapshot.Load().engine.CheckExactText("内部渠道").Blocked {
-		t.Fatal("negative feedback did not suppress hard keyword")
-	}
-	if err := instance.reloadLexicon(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if instance.snapshot.Load().engine.CheckExactText("内部渠道").Blocked {
-		t.Fatal("reloadLexicon() dropped negative feedback")
+	if len(repository.created) != 1 || repository.created[0].MessageContent != raw || repository.created[0].DetectionSource != "llm" {
+		t.Fatalf("created = %+v", repository.created)
 	}
 }
 
-// TestHandleExactViolationModeratesAndRecords 验证精准规则执行禁言、筛选撤回和审计。
+// TestHandleWeightedViolationModeratesAndRecords 验证本地累计权重执行禁言、筛选撤回和审计。
 // @param t：Go测试上下文。
 // @returns 无。
 // ⚠️副作用说明：修改fake Action与仓储记录。
-func TestHandleExactViolationModeratesAndRecords(t *testing.T) {
+func TestHandleWeightedViolationModeratesAndRecords(t *testing.T) {
 	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
 	repository := &fakeMonitorRepository{}
 	actions := &fakeActions{history: onebot.GetGroupMessageHistoryResult{Messages: []onebot.GroupHistoryMessage{
@@ -521,8 +798,7 @@ func TestHandleExactViolationModeratesAndRecords(t *testing.T) {
 		{Time: now.Unix(), MessageID: 7, UserID: 300},
 		{Time: now.Add(time.Minute).Unix(), MessageID: 10, UserID: 200},
 	}}}
-	config := DefaultEngineConfig()
-	config.HardKeywords = []string{"内部渠道"}
+	config := EngineConfig{ViolationThreshold: 60, WeightedKeywords: []WeightedKeyword{{Text: "内部渠道", Weight: 60}}}
 	engine, err := NewEngine(config)
 	// [决策理由] 测试规则必须成功构造才能验证处置链路。
 	if err != nil {
@@ -549,25 +825,24 @@ func TestHandleExactViolationModeratesAndRecords(t *testing.T) {
 		t.Fatalf("history params = %+v", actions.historyParams)
 	}
 	// [决策理由] 自动动作必须对应唯一待复核证据。
-	if len(repository.created) != 1 || repository.created[0].DetectionSource != "precise_rule" || repository.created[0].MessageContent != "内部渠道" {
+	if len(repository.created) != 1 || repository.created[0].DetectionSource != "weighted_score" || repository.created[0].MessageContent != "内部渠道" {
 		t.Fatalf("created = %+v", repository.created)
 	}
 
 	// >>> 数据演变示例
-	// 1. 硬词命中+历史含本人2条 -> 禁言30天+撤回2条+审计1条。
+	// 1. 本地权重达阈值+历史含本人2条 -> 禁言30天+撤回2条+审计1条。
 	// 2. 他人消息或锚点后消息 -> 筛选跳过。
 }
 
-// TestHandleExactViolationIsIdempotent 验证重复事件只执行一次外部处罚。
+// TestHandleWeightedViolationIsIdempotent 验证重复事件只执行一次外部处罚。
 // @param t：Go测试上下文。
 // @returns 无。
 // ⚠️副作用说明：修改fake仓储与Action调用记录。
-func TestHandleExactViolationIsIdempotent(t *testing.T) {
+func TestHandleWeightedViolationIsIdempotent(t *testing.T) {
 	now := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
 	repository := &fakeMonitorRepository{}
 	actions := &fakeActions{}
-	config := DefaultEngineConfig()
-	config.HardKeywords = []string{"固定广告"}
+	config := EngineConfig{ViolationThreshold: 60, WeightedKeywords: []WeightedKeyword{{Text: "固定广告", Weight: 60}}}
 	engine, err := NewEngine(config)
 	// [决策理由] 规则构造失败时无法验证重复处置链路。
 	if err != nil {
@@ -591,15 +866,14 @@ func TestHandleExactViolationIsIdempotent(t *testing.T) {
 	// 2. 重复message9 -> 预留未获得 -> 无第二次Action。
 }
 
-// TestHandleExactViolationSkipsActionsWhenReservationFails 验证数据库预留失败时不处罚。
+// TestHandleWeightedViolationSkipsActionsWhenReservationFails 验证数据库预留失败时不处罚。
 // @param t：Go测试上下文。
 // @returns 无。
 // ⚠️副作用说明：读取fake Action调用记录。
-func TestHandleExactViolationSkipsActionsWhenReservationFails(t *testing.T) {
+func TestHandleWeightedViolationSkipsActionsWhenReservationFails(t *testing.T) {
 	repository := &fakeMonitorRepository{reserveErr: errors.New("db unavailable")}
 	actions := &fakeActions{}
-	config := DefaultEngineConfig()
-	config.HardKeywords = []string{"固定广告"}
+	config := EngineConfig{ViolationThreshold: 60, WeightedKeywords: []WeightedKeyword{{Text: "固定广告", Weight: 60}}}
 	engine, err := NewEngine(config)
 	// [决策理由] 测试必须先构造可命中的确定性规则。
 	if err != nil {
@@ -626,11 +900,18 @@ func TestHandleWhitelistBypassesDetection(t *testing.T) {
 	instance := testImplementation()
 	repository := instance.repository.(*fakeMonitorRepository)
 	repository.whitelisted = true
-	event := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message"}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 9, RawMessage: "微信 vxabc123"}
-	err := dispatchEvent(instance, context.Background(), event)
+	evaluator := &fakeLLMEvaluator{result: LLMEvaluationResult{RiskLevel: "High", TotalScore: 90, Reason: "违规", Violations: []string{"广告"}, SuggestedAction: "block"}}
+	config := EngineConfig{ViolationThreshold: 60, WeightedKeywords: []WeightedKeyword{{Text: "广告", Weight: 100}}}
+	engine, err := NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.snapshot.Store(&runtimeSnapshot{engine: engine, engineConfig: config, evaluator: evaluator, llmTimeout: time.Second, llmMaxConcurrency: 2, llmDailyRequestLimit: 500, minLLMMessageLength: 1})
+	event := &ws.MessageEvent{BaseEvent: ws.BaseEvent{PostType: "message"}, MessageType: "group", GroupID: 100, UserID: 200, MessageID: 9, RawMessage: "高风险广告"}
+	err = dispatchEvent(instance, context.Background(), event)
 	// [决策理由] 白名单必须在任何硬词或评分检测前直接放行。
-	if err != nil || len(instance.actions.(*fakeActions).banParams) != 0 || len(repository.created) != 0 {
-		t.Fatalf("Handle() error=%v bans=%+v audits=%+v", err, instance.actions.(*fakeActions).banParams, repository.created)
+	if err != nil || repository.validSpeechCalls != 1 || evaluator.calls != 0 || len(instance.actions.(*fakeActions).banParams) != 0 || len(repository.created) != 0 {
+		t.Fatalf("Handle() error=%v speeches=%d llm=%d bans=%+v audits=%+v", err, repository.validSpeechCalls, evaluator.calls, instance.actions.(*fakeActions).banParams, repository.created)
 	}
 
 	// >>> 数据演变示例

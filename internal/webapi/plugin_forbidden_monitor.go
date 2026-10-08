@@ -1,4 +1,4 @@
-// 📌 影响范围：读写违禁监控的复核队列、文本试判、训练样本与词库；写操作会修改数据库、审计，并可能调用 NapCat 与外部模型。
+// 📌 影响范围：读写违禁监控的复核队列、文本试判与加权词库；写操作会修改数据库、审计，并可能调用 NapCat 与外部模型。
 package webapi
 
 import (
@@ -16,16 +16,10 @@ type ForbiddenMonitorController interface {
 	ListViolations(context.Context, management.Actor, int, int) (forbiddenmonitor.RecordPage, error)
 	ReviewViolation(context.Context, management.Actor, int64, int64, string) (forbiddenmonitor.Record, error)
 	RunTextTrial(context.Context, management.Actor, string) (forbiddenmonitor.Record, error)
-	ListTrainingSamples(context.Context, management.Actor, int, int) (forbiddenmonitor.RecordPage, error)
-	CreateTrainingSample(context.Context, management.Actor, string, string) (forbiddenmonitor.Record, error)
-	DeleteTrainingSample(context.Context, management.Actor, int64, int64) error
-	ListTerms(context.Context, management.Actor, string, int, int) ([]forbiddenmonitor.Term, int64, error)
+	ListTerms(context.Context, management.Actor, int, int) ([]forbiddenmonitor.Term, int64, error)
 	CreateTerm(context.Context, management.Actor, forbiddenmonitor.TermInput) (forbiddenmonitor.Term, error)
 	UpdateTerm(context.Context, management.Actor, int64, int64, forbiddenmonitor.TermInput) (forbiddenmonitor.Term, error)
 	DeleteTerm(context.Context, management.Actor, int64, int64) error
-	ListCombinations(context.Context, management.Actor, int, int) ([]forbiddenmonitor.Combination, int64, error)
-	CreateCombination(context.Context, management.Actor, forbiddenmonitor.CombinationInput) (forbiddenmonitor.Combination, error)
-	DeleteCombination(context.Context, management.Actor, int64, int64) error
 }
 
 type reviewRequest struct {
@@ -37,21 +31,15 @@ type textTrialRequest struct {
 	Text string `json:"text"`
 }
 
-type trainingSampleRequest struct {
-	Text    string `json:"msg_content"`
-	TrialID string `json:"trial_id"`
+type createTermRequest struct {
+	Text   string  `json:"text"`
+	Weight float64 `json:"weight"`
 }
 
-type termRequest struct {
-	Kind            string  `json:"kind"`
+type updateTermRequest struct {
 	Text            string  `json:"text"`
 	Weight          float64 `json:"weight"`
 	ExpectedVersion int64   `json:"expected_version"`
-}
-
-type combinationRequest struct {
-	Terms []string `json:"terms"`
-	Bonus float64  `json:"bonus"`
 }
 
 type versionedDeleteRequest struct {
@@ -123,78 +111,11 @@ func (s *Server) createTextTrial(writer http.ResponseWriter, request *http.Reque
 	writeSuccess(writer, record)
 
 	// >>> 数据演变示例
-	// 1. 硬词文本 -> precise_rule 违规结论 -> 200。
+	// 1. 高权重文本 -> weighted_score 违规结论 -> 200。
 	// 2. 空文本 -> 400。
 }
 
-// listTrainingSamples 分页返回管理员投喂的违规正例。
-// @param writer：响应写入器；request：已鉴权请求。
-// @returns 无。
-// ⚠️副作用说明：读取 PostgreSQL 并写 JSON 响应。
-func (s *Server) listTrainingSamples(writer http.ResponseWriter, request *http.Request) {
-	page, pageSize, ok := forbiddenPagination(writer, request)
-	if !ok {
-		return
-	}
-	result, err := s.forbiddenMonitor.ListTrainingSamples(request.Context(), actorFromRequest(request), page, pageSize)
-	if err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, result)
-
-	// >>> 数据演变示例
-	// 1. page1 -> 最近样本分页 -> 200。
-	// 2. 数据库失败 -> 500。
-}
-
-// createTrainingSample 按试判凭证投喂违规正例。
-// @param writer：响应写入器；request：已鉴权严格 JSON 请求。
-// @returns 无。
-// ⚠️副作用说明：写入训练样本与候选词证据，并推动候选词晋级。
-func (s *Server) createTrainingSample(writer http.ResponseWriter, request *http.Request) {
-	var input trainingSampleRequest
-	if err := decodeJSON(writer, request, &input); err != nil || input.Text == "" || input.TrialID == "" {
-		writeError(writer, http.StatusBadRequest, "invalid_forbidden_monitor", "训练样本参数无效")
-		return
-	}
-	record, err := s.forbiddenMonitor.CreateTrainingSample(request.Context(), actorFromRequest(request), input.Text, input.TrialID)
-	if err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, record)
-
-	// >>> 数据演变示例
-	// 1. 文本+有效试判凭证 -> 落库并提取风险词 -> 200。
-	// 2. 凭证过期 -> 400。
-}
-
-// deleteTrainingSample 按乐观锁删除训练样本。
-// @param writer：响应写入器；request：携带样本 ID 的已鉴权请求。
-// @returns 无。
-// ⚠️副作用说明：删除样本并回退候选词统计。
-func (s *Server) deleteTrainingSample(writer http.ResponseWriter, request *http.Request) {
-	id, ok := pathInt64(writer, request, "sample_id", "invalid_forbidden_monitor")
-	if !ok {
-		return
-	}
-	version, ok := decodeVersion(writer, request)
-	if !ok {
-		return
-	}
-	if err := s.forbiddenMonitor.DeleteTrainingSample(request.Context(), actorFromRequest(request), id, version); err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, map[string]bool{"deleted": true})
-
-	// >>> 数据演变示例
-	// 1. id1+v1 -> 删除并回退统计 -> 200。
-	// 2. 缺少版本 -> 400。
-}
-
-// listTerms 按分类分页返回词库词条。
+// listTerms 分页返回加权违禁词。
 // @param writer：响应写入器；request：已鉴权请求。
 // @returns 无。
 // ⚠️副作用说明：读取 PostgreSQL 并写 JSON 响应。
@@ -203,7 +124,7 @@ func (s *Server) listTerms(writer http.ResponseWriter, request *http.Request) {
 	if !ok {
 		return
 	}
-	items, total, err := s.forbiddenMonitor.ListTerms(request.Context(), actorFromRequest(request), request.URL.Query().Get("kind"), page, pageSize)
+	items, total, err := s.forbiddenMonitor.ListTerms(request.Context(), actorFromRequest(request), page, pageSize)
 	if err != nil {
 		writeForbiddenMonitorError(writer, err)
 		return
@@ -211,8 +132,8 @@ func (s *Server) listTerms(writer http.ResponseWriter, request *http.Request) {
 	writeSuccess(writer, map[string]any{"items": items, "page": page, "page_size": pageSize, "total": total})
 
 	// >>> 数据演变示例
-	// 1. kind=hard -> 仅硬性关键词 -> 200。
-	// 2. 未知分类 -> 400。
+	// 1. page1 -> 加权违禁词分页 -> 200。
+	// 2. page_size超限 -> 400。
 }
 
 // createTerm 新增词库词条并重建检测引擎。
@@ -220,13 +141,12 @@ func (s *Server) listTerms(writer http.ResponseWriter, request *http.Request) {
 // @returns 无。
 // ⚠️副作用说明：写入词条与审计，并按新词库重建检测引擎。
 func (s *Server) createTerm(writer http.ResponseWriter, request *http.Request) {
-	var input termRequest
-	// [决策理由] 新增不接受版本字段，避免客户端误以为可指定初始版本。
-	if err := decodeJSON(writer, request, &input); err != nil || input.ExpectedVersion != 0 {
+	var input createTermRequest
+	if err := decodeJSON(writer, request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_forbidden_monitor", "词条参数无效")
 		return
 	}
-	term, err := s.forbiddenMonitor.CreateTerm(request.Context(), actorFromRequest(request), forbiddenmonitor.TermInput{Kind: input.Kind, Text: input.Text, Weight: input.Weight})
+	term, err := s.forbiddenMonitor.CreateTerm(request.Context(), actorFromRequest(request), forbiddenmonitor.TermInput{Text: input.Text, Weight: input.Weight})
 	if err != nil {
 		writeForbiddenMonitorError(writer, err)
 		return
@@ -234,8 +154,8 @@ func (s *Server) createTerm(writer http.ResponseWriter, request *http.Request) {
 	writeSuccess(writer, term)
 
 	// >>> 数据演变示例
-	// 1. risk+"加微信"+25 -> 新增 v1 并热重建引擎 -> 200。
-	// 2. 同分类重复词条 -> 409。
+	// 1. "加微信"+25 -> 新增 v1 并热重建引擎 -> 200。
+	// 2. 清洗后重复词条 -> 409。
 }
 
 // updateTerm 按乐观锁更新词库词条并重建检测引擎。
@@ -247,12 +167,12 @@ func (s *Server) updateTerm(writer http.ResponseWriter, request *http.Request) {
 	if !ok {
 		return
 	}
-	var input termRequest
+	var input updateTermRequest
 	if err := decodeJSON(writer, request, &input); err != nil || input.ExpectedVersion <= 0 {
 		writeError(writer, http.StatusBadRequest, "invalid_forbidden_monitor", "词条参数无效")
 		return
 	}
-	term, err := s.forbiddenMonitor.UpdateTerm(request.Context(), actorFromRequest(request), id, input.ExpectedVersion, forbiddenmonitor.TermInput{Kind: input.Kind, Text: input.Text, Weight: input.Weight})
+	term, err := s.forbiddenMonitor.UpdateTerm(request.Context(), actorFromRequest(request), id, input.ExpectedVersion, forbiddenmonitor.TermInput{Text: input.Text, Weight: input.Weight})
 	if err != nil {
 		writeForbiddenMonitorError(writer, err)
 		return
@@ -288,30 +208,15 @@ func (s *Server) deleteTerm(writer http.ResponseWriter, request *http.Request) {
 	// 2. 词条已被删除 -> 404。
 }
 
-// listCombinations 分页返回组合加成规则。
-// @param writer：响应写入器；request：已鉴权请求。
-// @returns 无。
-// ⚠️副作用说明：读取 PostgreSQL 并写 JSON 响应。
-func (s *Server) listCombinations(writer http.ResponseWriter, request *http.Request) {
-	page, pageSize, ok := forbiddenPagination(writer, request)
-	if !ok {
-		return
-	}
-	items, total, err := s.forbiddenMonitor.ListCombinations(request.Context(), actorFromRequest(request), page, pageSize)
-	if err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, map[string]any{"items": items, "page": page, "page_size": pageSize, "total": total})
-
-	// >>> 数据演变示例
-	// 1. page1 -> 组合规则分页 -> 200。
-	// 2. page_size 超限 -> 400。
-}
-
 func forbiddenPagination(writer http.ResponseWriter, request *http.Request) (int, int, bool) {
 	page, pageSize := 1, 20
 	var err error
+	for name, values := range request.URL.Query() {
+		if (name != "page" && name != "page_size") || len(values) != 1 || values[0] == "" {
+			writeError(writer, http.StatusBadRequest, "invalid_forbidden_monitor", "分页参数无效")
+			return 0, 0, false
+		}
+	}
 	if raw := request.URL.Query().Get("page"); raw != "" {
 		page, err = strconv.Atoi(raw)
 		if err != nil || page < 1 || page > 1_000_000 {
@@ -327,52 +232,6 @@ func forbiddenPagination(writer http.ResponseWriter, request *http.Request) (int
 		}
 	}
 	return page, pageSize, true
-}
-
-// createCombination 新增组合加成规则并重建检测引擎。
-// @param writer：响应写入器；request：已鉴权严格 JSON 请求。
-// @returns 无。
-// ⚠️副作用说明：写入组合规则与审计，并按新词库重建检测引擎。
-func (s *Server) createCombination(writer http.ResponseWriter, request *http.Request) {
-	var input combinationRequest
-	if err := decodeJSON(writer, request, &input); err != nil || len(input.Terms) == 0 {
-		writeError(writer, http.StatusBadRequest, "invalid_forbidden_monitor", "组合规则参数无效")
-		return
-	}
-	combination, err := s.forbiddenMonitor.CreateCombination(request.Context(), actorFromRequest(request), forbiddenmonitor.CombinationInput{Terms: input.Terms, Bonus: input.Bonus})
-	if err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, combination)
-
-	// >>> 数据演变示例
-	// 1. ["加","微信"]+30 -> 新增 v1 并热重建引擎 -> 200。
-	// 2. 只有一个词项 -> 400。
-}
-
-// deleteCombination 按乐观锁删除组合加成规则并重建检测引擎。
-// @param writer：响应写入器；request：携带组合 ID 的已鉴权请求。
-// @returns 无。
-// ⚠️副作用说明：删除组合规则、写审计并按新词库重建检测引擎。
-func (s *Server) deleteCombination(writer http.ResponseWriter, request *http.Request) {
-	id, ok := pathInt64(writer, request, "combination_id", "invalid_forbidden_monitor")
-	if !ok {
-		return
-	}
-	version, ok := decodeVersion(writer, request)
-	if !ok {
-		return
-	}
-	if err := s.forbiddenMonitor.DeleteCombination(request.Context(), actorFromRequest(request), id, version); err != nil {
-		writeForbiddenMonitorError(writer, err)
-		return
-	}
-	writeSuccess(writer, map[string]bool{"deleted": true})
-
-	// >>> 数据演变示例
-	// 1. id1+v1 -> 删除并热重建引擎 -> 200。
-	// 2. 缺少版本 -> 400。
 }
 
 // pathInt64 解析路径中的正整数标识。
